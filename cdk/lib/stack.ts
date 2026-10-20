@@ -137,8 +137,9 @@ export class A2AIncidentResponseStack extends cdk.Stack {
       authorizerConfiguration: {
         customJwtAuthorizer: { discoveryUrl, allowedClients: [monitoringClient.userPoolClientId, remediationClient.userPoolClientId] },
       },
-      // Required by the service even though the CFN type marks it optional -- the first real
-      // deploy attempt failed with "NetworkConfiguration is required" until this was added.
+      // Required by the service; the CFN/CDK type is non-optional too (checked directly
+      // against aws-cdk-lib's generated types). First deploy attempt just missed it --
+      // failed with "NetworkConfiguration is required" until this was added.
       networkConfiguration: { networkMode: 'PUBLIC' },
       environmentVariables: { AWS_REGION: this.region },
     });

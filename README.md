@@ -81,10 +81,14 @@ this session had a fresh login and got all the way to a real deploy, which surfa
 edges that are far more specific to AgentCore itself. In the order they had to be fixed
 to get `cdk deploy` past `CREATE_FAILED`:
 
-1. **`NetworkConfiguration` is required, even though the CDK L1 construct's TypeScript
-   type marks it optional.** `cdk synth` accepts a `CfnRuntime` with no
-   `networkConfiguration`; the service rejects it at deploy time with "Invalid request
-   provided: NetworkConfiguration is required". Needed `networkConfiguration: {
+1. **`NetworkConfiguration` is required, and the first deploy attempt didn't set it.**
+   Correction (2026-10-21): the original wording here blamed the CDK L1 construct's
+   TypeScript type for marking this field optional. That's wrong -- checked directly
+   against `aws-cdk-lib@2.250.0`'s generated types, `CfnRuntimeProps.networkConfiguration`
+   has no `?`; it's non-optional in the interface itself, matching the underlying
+   CloudFormation resource. This was a plain miss on the first pass, not a typing gap.
+   The service rejects a runtime with none at deploy time ("Invalid request provided:
+   NetworkConfiguration is required"); the fix was adding `networkConfiguration: {
    networkMode: 'PUBLIC' }` on both runtimes.
 2. **A circular-looking IAM policy, caused by cross-referencing the other Runtime's ARN,
    was actually a dependency-ordering RACE, not a circular dependency.** The cross-runtime
