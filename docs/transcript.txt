@@ -1,0 +1,10 @@
+NOT YET RUN.
+
+This repo's code was scaffolded and committed on 2026-10-20, but `make deploy` / `make demo`
+/ `make destroy` could not be run in that session: the local AWS SSO session for the
+`personal` profile (account 129875820670) had expired, and refreshing it requires an
+interactive browser login (SSO portal + MFA) that an unattended agent session cannot
+complete. See README.md's "Status" section for the exact next step.
+
+Run `aws sso login --profile personal`, then `make deploy && make demo && make destroy`
+from the repo root. `make demo` overwrites this file with the real transcript.

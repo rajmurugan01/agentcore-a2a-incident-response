@@ -1,0 +1,39 @@
+{
+  "high_cpu": {
+    "match": ["cpu", "cpuutilization", "load"],
+    "title": "High CPU utilisation",
+    "steps": [
+      "Confirm the alarm is sustained, not a brief spike (check 15-minute average, not one datapoint).",
+      "Check for a stuck retry loop or a deploy that landed without the expected autoscaling policy.",
+      "Scale out (increase desired count) before scaling up; cheaper and faster to reverse.",
+      "If a single task/instance is the outlier, replace it rather than restarting in place."
+    ]
+  },
+  "error_rate": {
+    "match": ["error", "5xx", "failure", "exception"],
+    "title": "Elevated error rate",
+    "steps": [
+      "Pull the last 15 minutes of application logs for the affected service and group by error message.",
+      "Check the most recent deploy timestamp against when the error rate started climbing.",
+      "If tied to a deploy, roll back first and investigate second -- restoring service comes before root cause.",
+      "If not tied to a deploy, check a dependency (database, downstream API) for its own alarms."
+    ]
+  },
+  "latency": {
+    "match": ["latency", "p99", "p95", "slow", "timeout"],
+    "title": "Elevated latency",
+    "steps": [
+      "Check whether latency correlates with a traffic spike (likely capacity) or is flat-rate (likely a dependency).",
+      "Look for a downstream service's own latency/error alarms before assuming the local service is at fault.",
+      "If capacity-bound, scale out; if dependency-bound, consider a circuit breaker or cached fallback."
+    ]
+  },
+  "default": {
+    "match": [],
+    "title": "Unclassified finding",
+    "steps": [
+      "No runbook matched this finding's keywords. Escalate to a human on-call with the raw finding text.",
+      "Do not take an automated remediation action on an unclassified finding."
+    ]
+  }
+}
