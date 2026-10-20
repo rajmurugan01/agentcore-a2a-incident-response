@@ -22,7 +22,11 @@ logger = logging.getLogger("monitoring_agent")
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", 8080))
+# AgentCore Runtime's A2A ProtocolConfiguration proxies the container on port 9000 at the
+# root path, NOT port 8080/invocations (that's the plain HTTP/MCP protocol convention) --
+# confirmed against AWS's A2A devguide after the first deploy attempt used 8080 and the
+# runtime came up but was unreachable for A2A invocation. See README "sharp edge".
+PORT = int(os.environ.get("PORT", 9000))
 RUNTIME_URL = os.environ.get("AGENTCORE_RUNTIME_URL", f"http://127.0.0.1:{PORT}/")
 
 SYSTEM_PROMPT = (
@@ -34,7 +38,13 @@ SYSTEM_PROMPT = (
 )
 
 model = BedrockModel(
-    model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-3-5-haiku-20241022-v1:0"),
+    # Claude 3.5 Haiku has reached end-of-life on Bedrock (confirmed live: InvokeModel
+    # returned ResourceNotFoundException "This model version has reached the end of its
+    # life" during this deploy's first demo run) -- Haiku 4.5 is the current GA
+    # fast/cheap-tier model (model card: lifecycle Active, EOL N/A, launched 2025-10-16).
+    # us-east-1 has no in-Region inference profile for it, only geo/global cross-Region --
+    # "us.anthropic..." below is the US geo profile, confirmed against the AWS model card.
+    model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
     region_name=REGION,
     temperature=0.1,
     max_tokens=1024,

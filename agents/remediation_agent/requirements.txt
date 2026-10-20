@@ -2,6 +2,11 @@ bedrock-agentcore>=0.1.0
 langgraph>=0.2.0
 langchain-aws>=0.2.0
 langchain-core>=0.3.0
-a2a-sdk>=0.2.0
+# Pinned, not >=0.2.0: a2a-sdk 1.x (the PyPI default as of 2026-10) removed the
+# a2a.server.apps.A2AStarletteApplication module this code is written against (restructured
+# into a2a.server.routes). Caught this when `import agent` threw ModuleNotFoundError on
+# `a2a.server.apps` after `pip install -r requirements.txt` pulled 1.2.3 under the loose pin.
+# 0.3.26 is the last 0.3.x release with the apps/ module intact.
+a2a-sdk[http-server]==0.3.26
 boto3>=1.35.0
 uvicorn>=0.30.0

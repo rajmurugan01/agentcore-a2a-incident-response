@@ -5,3 +5,4 @@ cdk/cdk.outputs.json
 __pycache__/
 *.pyc
 .DS_Store
+.venv/

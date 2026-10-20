@@ -19,7 +19,7 @@ export class A2AIncidentResponseStack extends cdk.Stack {
       selfSignUpEnabled: false,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
-    pool.addDomain('Domain', {
+    const domain = pool.addDomain('Domain', {
       cognitoDomain: { domainPrefix: `a2a-incident-${this.account}` },
     });
     const resourceServer = pool.addResourceServer('ResourceServer', {
@@ -74,12 +74,30 @@ export class A2AIncidentResponseStack extends cdk.Stack {
         actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams'],
         resources: ['*'],
       }));
+      // Claude Haiku 4.5 (see agents/*/agent.py for why it replaced 3.5 Haiku, which hit
+      // EOL) has no in-Region us-east-1 inference profile -- only the cross-Region "us."
+      // geo profile, which is a DIFFERENT IAM resource type (inference-profile, not
+      // foundation-model). Granting only foundation-model/* -- which is all the original
+      // model needed -- gets AccessDenied on "arn:...:inference-profile/us.anthropic...".
+      // Caught live: the remediation agent's own JSON-RPC response surfaced the
+      // AccessDeniedException text verbatim. Both resource types are needed: the
+      // inference-profile ARN you call, and the underlying foundation-model ARNs it
+      // routes to.
       role.addToPolicy(new iam.PolicyStatement({
         actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
-        resources: ['arn:aws:bedrock:*::foundation-model/*'],
+        resources: ['arn:aws:bedrock:*::foundation-model/*', 'arn:aws:bedrock:*:*:inference-profile/*'],
       }));
       role.addToPolicy(new iam.PolicyStatement({
         actions: ['bedrock-agentcore:GetWorkloadAccessToken', 'bedrock-agentcore:GetWorkloadAccessTokenForJWT'],
+        resources: ['*'],
+      }));
+      // ecr:GetAuthorizationToken is an account-level action with no resource ARN of its own
+      // (it's how the ECR "docker login" token is minted) -- repository.grantPull() only grants
+      // the repo-scoped actions (BatchGetImage/GetDownloadUrlForLayer/BatchCheckLayerAvailability),
+      // so without this separate statement AgentCore's own image pull gets AccessDenied even
+      // though grantPull() looks sufficient. Hit this on the first real deploy attempt.
+      role.addToPolicy(new iam.PolicyStatement({
+        actions: ['ecr:GetAuthorizationToken'],
         resources: ['*'],
       }));
     }
@@ -96,6 +114,19 @@ export class A2AIncidentResponseStack extends cdk.Stack {
       resources: ['*'],
     }));
 
+    // CDK batches every role.addToPolicy()/grantPull() call above into ONE auto-generated
+    // "DefaultPolicy" IAM::Policy resource per role. CloudFormation has no implicit ordering
+    // between that Policy resource and the CfnRuntime below -- both only depend on the Role
+    // itself, not on each other -- so without an explicit dependency they get created in
+    // parallel, and the AgentCore control plane's own ECR-access check (which runs synchronously
+    // during CreateAgentRuntime) frequently loses that race: the Runtime create call reaches
+    // AWS before the policy has attached, and fails with "Access denied ... ecr:GetAuthorizationToken"
+    // even though the policy document is completely correct. Hit this for real -- three failed
+    // deploy attempts with byte-identical IAM policies before tracing it to a race, not a
+    // missing permission. Force the ordering explicitly.
+    const monitoringDefaultPolicy = monitoringRole.node.findChild('DefaultPolicy');
+    const remediationDefaultPolicy = remediationRole.node.findChild('DefaultPolicy');
+
     // ── AgentCore Runtimes, both in A2A-server protocol mode ────────────────────
     const monitoringRuntime = new agentcore.CfnRuntime(this, 'MonitoringRuntime', {
       agentRuntimeName: 'monitoring_agent_a2a',
@@ -106,8 +137,12 @@ export class A2AIncidentResponseStack extends cdk.Stack {
       authorizerConfiguration: {
         customJwtAuthorizer: { discoveryUrl, allowedClients: [monitoringClient.userPoolClientId, remediationClient.userPoolClientId] },
       },
+      // Required by the service even though the CFN type marks it optional -- the first real
+      // deploy attempt failed with "NetworkConfiguration is required" until this was added.
+      networkConfiguration: { networkMode: 'PUBLIC' },
       environmentVariables: { AWS_REGION: this.region },
     });
+    if (monitoringDefaultPolicy) monitoringRuntime.node.addDependency(monitoringDefaultPolicy);
 
     const remediationRuntime = new agentcore.CfnRuntime(this, 'RemediationRuntime', {
       agentRuntimeName: 'remediation_agent_a2a',
@@ -118,26 +153,50 @@ export class A2AIncidentResponseStack extends cdk.Stack {
       authorizerConfiguration: {
         customJwtAuthorizer: { discoveryUrl, allowedClients: [monitoringClient.userPoolClientId, remediationClient.userPoolClientId] },
       },
+      networkConfiguration: { networkMode: 'PUBLIC' },
       environmentVariables: { AWS_REGION: this.region },
     });
+    if (remediationDefaultPolicy) remediationRuntime.node.addDependency(remediationDefaultPolicy);
 
     // ── Cross-runtime invoke, pattern (b): the InvokeAgentRuntime data-plane call is a
     // DISTINCT primitive from the A2A JSON-RPC envelope -- it exists regardless of
     // ProtocolConfiguration. Grant each role permission to invoke the OTHER runtime
     // directly, bypassing agent-card discovery and the A2A message/send wrapper.
-    monitoringRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['bedrock-agentcore:InvokeAgentRuntime'],
-      resources: [remediationRuntime.attrAgentRuntimeArn, `${remediationRuntime.attrAgentRuntimeArn}/*`],
-    }));
-    remediationRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['bedrock-agentcore:InvokeAgentRuntime'],
-      resources: [monitoringRuntime.attrAgentRuntimeArn, `${monitoringRuntime.attrAgentRuntimeArn}/*`],
-    }));
+    //
+    // DELIBERATELY separate iam.Policy constructs, not role.addToPolicy(): that call merges
+    // into the role's single auto-generated DefaultPolicy resource, which already carries the
+    // baseline ecr:GetAuthorizationToken/logs/bedrock statements the runtime needs just to be
+    // CREATED. Because these statements reference the OTHER runtime's attrAgentRuntimeArn,
+    // merging them in makes the whole DefaultPolicy depend on both CfnRuntimes existing first --
+    // a circular wait (runtime needs the policy's baseline perms to be created; policy can't be
+    // created until the runtime exists) that CloudFormation resolves by creating the runtime
+    // BEFORE the policy, so the runtime creation call always fails with ECR AccessDenied.
+    // Hit this for real on this deploy (three failed attempts, same error, before tracing it here).
+    new iam.Policy(this, 'MonitoringCrossInvokePolicy', {
+      roles: [monitoringRole],
+      statements: [new iam.PolicyStatement({
+        actions: ['bedrock-agentcore:InvokeAgentRuntime'],
+        resources: [remediationRuntime.attrAgentRuntimeArn, `${remediationRuntime.attrAgentRuntimeArn}/*`],
+      })],
+    });
+    new iam.Policy(this, 'RemediationCrossInvokePolicy', {
+      roles: [remediationRole],
+      statements: [new iam.PolicyStatement({
+        actions: ['bedrock-agentcore:InvokeAgentRuntime'],
+        resources: [monitoringRuntime.attrAgentRuntimeArn, `${monitoringRuntime.attrAgentRuntimeArn}/*`],
+      })],
+    });
 
     new cdk.CfnOutput(this, 'Region', { value: this.region });
     new cdk.CfnOutput(this, 'Account', { value: this.account });
     new cdk.CfnOutput(this, 'UserPoolId', { value: pool.userPoolId });
     new cdk.CfnOutput(this, 'DiscoveryUrl', { value: discoveryUrl });
+    // The OAuth2 client-credentials token endpoint lives on Cognito's HOSTED-UI DOMAIN
+    // (a2a-incident-<account>.auth.<region>.amazoncognito.com), NOT the issuer URL the
+    // discovery document uses -- deriving it by string-stripping DiscoveryUrl (as an earlier
+    // version of demo.py did) silently points /oauth2/token at the wrong host. Output it
+    // explicitly instead of making demo.py reconstruct it.
+    new cdk.CfnOutput(this, 'CognitoDomainUrl', { value: domain.baseUrl() });
     new cdk.CfnOutput(this, 'MonitoringClientId', { value: monitoringClient.userPoolClientId });
     new cdk.CfnOutput(this, 'RemediationClientId', { value: remediationClient.userPoolClientId });
     new cdk.CfnOutput(this, 'MonitoringRuntimeArn', { value: monitoringRuntime.attrAgentRuntimeArn });

@@ -1,10 +1,42 @@
-NOT YET RUN.
+======================================================================
+AgentCore A2A incident-response: three comms patterns, measured
+======================================================================
 
-This repo's code was scaffolded and committed on 2026-10-20, but `make deploy` / `make demo`
-/ `make destroy` could not be run in that session: the local AWS SSO session for the
-`personal` profile (account 129875820670) had expired, and refreshing it requires an
-interactive browser login (SSO portal + MFA) that an unattended agent session cannot
-complete. See README.md's "Status" section for the exact next step.
+== (a) DIRECT CALL -- no AgentCore hop ==
+    run 1/5: 4.568s
+    run 2/5: 2.480s
+    run 3/5: 2.585s
+    run 4/5: 2.637s
+    run 5/5: 2.641s
+  direct: min=2.480s median=2.637s max=4.568s (n=5)
+  sample output: # Remediation Recommendation
 
-Run `aws sso login --profile personal`, then `make deploy && make demo && make destroy`
-from the repo root. `make demo` overwrites this file with the real transcript.
+The 15-minute average CPU of 94% confirms this is sustained high utilization, not a transient spike, so immediate action is warran
+
+== (b) NATIVE AGENTCORE INVOKE -- InvokeAgentRuntime, raw payload, no A2A layer ==
+    run 1/5: 8.304s
+    run 2/5: 8.423s
+    run 3/5: 8.566s
+    run 4/5: 8.246s
+    run 5/5: 8.593s
+  native invoke: min=8.246s median=8.423s max=8.593s (n=5)
+  sample output: b'{"error":{"code":-32600,"data":[{"type":"missing","loc":["method"],"msg":"Field required","input":{"finding":"CPUUtilization alarm on service checkout-api has b'
+
+== (c) FULL A2A PROTOCOL -- agent-card discovery + OAuth + JSON-RPC message/send ==
+    run 1/5: 19.000s
+    run 2/5: 19.116s
+    run 3/5: 19.490s
+    run 4/5: 18.699s
+    run 5/5: 20.970s
+  full A2A: min=18.699s median=19.116s max=20.970s (n=5)
+  sample agent-card + response: (b'{"capabilities":{"streaming":false},"defaultInputModes":["text"],"defaultOutputModes":["text"],"description":"Classifies a monitoring finding and recommends 
+
+== Cost: measured call counts x published list prices (see demo.py constants) ==
+  Runs this session: 5 direct, 5 native-invoke, 5 full-A2A
+  AgentCore Runtime compute: billed per second of actual vCPU+memory consumption,
+  1-second minimum, at $0.0895/vCPU-hour + $0.00945/GB-hour (v1 list price).
+  Model cost per call depends on actual measured token counts, not estimated here --
+  pull them from this run's CloudWatch GetMetricData / Bedrock invocation logs and
+  multiply by $0.001/1K input + $0.005/1K output tokens (list price).
+
+Done.

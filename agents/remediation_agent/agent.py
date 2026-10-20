@@ -33,13 +33,17 @@ logger = logging.getLogger("remediation_agent")
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 HOST = os.environ.get("HOST", "0.0.0.0")
-PORT = int(os.environ.get("PORT", 8080))
+# AgentCore Runtime's A2A ProtocolConfiguration proxies the container on port 9000 at the
+# root path, not 8080 -- see monitoring_agent/agent.py for the full note.
+PORT = int(os.environ.get("PORT", 9000))
 
 with open(os.path.join(os.path.dirname(__file__), "runbooks.json")) as f:
     RUNBOOKS = json.load(f)
 
 model = ChatBedrock(
-    model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-3-5-haiku-20241022-v1:0"),
+    # See monitoring_agent/agent.py for why this isn't Claude 3.5 Haiku any more (EOL,
+    # confirmed live against the deployed stack) and why the model id is prefixed "us.".
+    model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
     region_name=REGION,
     model_kwargs={"temperature": 0.1, "max_tokens": 1024},
 )

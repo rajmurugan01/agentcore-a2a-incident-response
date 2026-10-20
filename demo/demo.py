@@ -9,10 +9,19 @@ agent, for real, against the stack deployed by `make deploy`:
                              then a JSON-RPC 2.0 `message/send` envelope through InvokeAgentRuntime.
 
 Both (b) and (c) go through the SAME AgentCore data-plane operation (InvokeAgentRuntime /
-GetAgentCard against the deployed Runtime's ARN) -- AgentCore does not expose a separate
-non-A2A "runtime URL" to curl directly when a custom JWT authorizer is attached. What
-differs between (b) and (c) is the payload shape and whether discovery/OAuth happens
-first, not the transport. That is itself one of this repo's findings; see README.
+GetAgentCard against the deployed Runtime's ARN) -- AgentCore DOES expose that operation
+as a bare HTTPS endpoint you can curl directly (`POST .../runtimes/{arn}/invocations`),
+but per AWS's own devguide, boto3 cannot be used to call it once a custom JWT authorizer
+is attached: "If you plan on integrating your agent with OAuth, you can't use the AWS SDK
+to call InvokeAgentRuntime. Instead, make an HTTPS request." A runtime supports EITHER IAM
+SigV4 OR JWT inbound auth, never both, so once CustomJwtAuthorizer is configured (as it is
+on both runtimes here, see cdk/lib/stack.ts), EVERY invocation -- not just the "full A2A"
+one -- needs a raw HTTPS call with an `Authorization: Bearer <token>` header; the original
+version of this script tried boto3's `invoke_agent_runtime`/`get_agent_card` for (b)/(c)
+and was rewritten to raw `urllib` calls once this was caught during the build, before the
+first live deploy. What differs between (b) and (c) is the payload shape and whether a
+GetAgentCard-equivalent discovery GET happens first, not the transport, which is identical
+for both. That is itself one of this repo's findings; see README.
 
 Run with: make demo  (wraps `python3 demo/demo.py | tee docs/transcript.txt`)
 """
@@ -22,9 +31,10 @@ import os
 import statistics
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
-
-import boto3
+from uuid import uuid4
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "agents", "monitoring_agent"))
@@ -41,8 +51,15 @@ TEST_FINDING = (
 # section for how measured counts are combined with these rates.
 PRICE_RUNTIME_VCPU_HOUR = 0.0895       # AgentCore Runtime v1, per vCPU-hour
 PRICE_RUNTIME_GB_HOUR = 0.00945        # AgentCore Runtime v1, per GB-hour (128MB minimum)
-PRICE_HAIKU_INPUT_PER_1K = 0.0008      # Claude 3.5 Haiku on Bedrock, us-east-1, on-demand
-PRICE_HAIKU_OUTPUT_PER_1K = 0.004
+# Claude HAIKU 4.5 (3.5 Haiku hit end-of-life mid-build -- see agents/*/agent.py), on
+# Bedrock, us-east-1, on-demand, via the "us." cross-Region inference profile. Rate
+# cross-checked against third-party aggregators (e.g. typingmind's Bedrock cost
+# reference), NOT independently confirmed against AWS's own pricing-page table, which
+# renders its price grid client-side and didn't return the figure to an automated fetch
+# during this build -- flagged, not fabricated; re-verify on https://aws.amazon.com/bedrock/pricing/
+# before using this for a real budget.
+PRICE_HAIKU_INPUT_PER_1K = 0.001       # $1.00 / 1M input tokens
+PRICE_HAIKU_OUTPUT_PER_1K = 0.005      # $5.00 / 1M output tokens
 
 
 def load_outputs():
@@ -80,12 +97,26 @@ def report(label, samples):
           f"(n={len(samples)})")
 
 
+def _load_module(name, path):
+    """Both agents' entrypoint files are named agent.py -- `import agent` after pushing
+    both directories onto sys.path resolves to whichever one sys.path happens to put
+    first (remediation_agent, since it's inserted after monitoring_agent at module load
+    time), silently shadowing the other. Caught this for real: pattern (a) crashed with
+    ImportError because `from agent import find_incidents_direct` resolved to
+    remediation_agent's agent.py, which has no such function. Load each by explicit file
+    path under its own module name instead of relying on sys.path/import-name ordering."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # ── (a) DIRECT CALL ──────────────────────────────────────────────────────────────────
 def pattern_a_direct():
-    from agent import find_incidents_direct  # monitoring_agent/agent.py
-    sys.path.insert(0, os.path.join(ROOT, "agents", "remediation_agent"))
-    import importlib
-    remediation = importlib.import_module("agent")  # remediation_agent/agent.py, same name clash avoided via sys.path order
+    monitoring = _load_module("monitoring_agent_module", os.path.join(ROOT, "agents", "monitoring_agent", "agent.py"))
+    remediation = _load_module("remediation_agent_module", os.path.join(ROOT, "agents", "remediation_agent", "agent.py"))
+    assert monitoring.find_incidents_direct  # confirms the monitoring agent's direct-call path also loaded
 
     def run():
         finding = TEST_FINDING  # in a real direct-call integration the monitoring call's
@@ -96,39 +127,61 @@ def pattern_a_direct():
     return timed(run)
 
 
+def _invocations_url(region, runtime_arn, suffix=""):
+    escaped = urllib.parse.quote(runtime_arn, safe="")
+    return f"https://bedrock-agentcore.{region}.amazonaws.com/runtimes/{escaped}/invocations{suffix}?qualifier=DEFAULT"
+
+
+def _bearer_headers(token):
+    # 33-256 char session id required by the service; uuid4's 36-char hex-with-dashes form fits.
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": str(uuid4()),
+    }
+
+
+def _post_json(url, headers, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST", headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
+def _get(url, headers):
+    req = urllib.request.Request(url, method="GET", headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read()
+
+
 # ── (b) NATIVE AGENTCORE INVOKE (no A2A layer) ──────────────────────────────────────
-def pattern_b_native_invoke(client, remediation_runtime_arn):
+def pattern_b_native_invoke(region, remediation_runtime_arn, token):
+    # Raw JSON payload straight to InvokeAgentRuntime's HTTPS endpoint, no agent-card
+    # discovery, no JSON-RPC envelope. Still needs the Bearer token: this runtime's
+    # CustomJwtAuthorizer is the ONLY inbound auth mode it accepts (see module docstring),
+    # so IAM/SigV4 (what boto3 would use) is rejected regardless of payload shape.
+    url = _invocations_url(region, remediation_runtime_arn)
+
     def run():
-        resp = client.invoke_agent_runtime(
-            agentRuntimeArn=remediation_runtime_arn,
-            qualifier="DEFAULT",
-            contentType="application/json",
-            accept="application/json",
-            payload=json.dumps({"finding": TEST_FINDING}).encode(),
-        )
-        return resp["response"].read()
+        return _post_json(url, _bearer_headers(token), {"finding": TEST_FINDING})
 
     return timed(run)
 
 
 # ── (c) FULL A2A PROTOCOL ────────────────────────────────────────────────────────────
-def pattern_c_full_a2a(client, remediation_runtime_arn, token):
+def pattern_c_full_a2a(region, remediation_runtime_arn, token):
+    card_url = _invocations_url(region, remediation_runtime_arn, suffix="/.well-known/agent-card.json")
+    invoke_url = _invocations_url(region, remediation_runtime_arn)
+
     def discover_and_send():
-        # Discovery: a real, distinct AgentCore data-plane operation for A2A agent-card
-        # retrieval -- GetAgentCard -- not a bare HTTPS fetch of .well-known/agent-card.json.
-        card = client.get_agent_card(agentRuntimeArn=remediation_runtime_arn, qualifier="DEFAULT")
+        card = _get(card_url, _bearer_headers(token))
         envelope = {
             "jsonrpc": "2.0", "id": "1", "method": "message/send",
-            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": TEST_FINDING}]}},
+            "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": TEST_FINDING}],
+                                    "messageId": str(uuid4())}},
         }
-        resp = client.invoke_agent_runtime(
-            agentRuntimeArn=remediation_runtime_arn,
-            qualifier="DEFAULT",
-            contentType="application/json",
-            accept="application/json",
-            payload=json.dumps(envelope).encode(),
-        )
-        return card["agentCard"], resp["response"].read()
+        resp = _post_json(invoke_url, _bearer_headers(token), envelope)
+        return card, resp
 
     return timed(discover_and_send)
 
@@ -147,19 +200,26 @@ def main():
     report("direct", a_samples)
     print(f"  sample output: {str(a_result)[:160]}")
 
-    client = boto3.client("bedrock-agentcore", region_name=region)
+    # Both (b) and (c) target a runtime whose ONLY inbound auth mode is the CustomJwtAuthorizer
+    # (see module docstring) -- fetch the monitoring agent's client-credentials token once and
+    # reuse it for both, exactly as the monitoring agent would when calling the remediation
+    # agent for real.
+    # NOTE: Cognito's OAuth2 token endpoint lives on the hosted-UI domain
+    # (CognitoDomainUrl), not the issuer URL in DiscoveryUrl -- an earlier version of this
+    # script derived it by string-stripping DiscoveryUrl, which silently 404s. See
+    # cdk/lib/stack.ts's CognitoDomainUrl output and comment.
+    token = get_client_credentials_token(
+        outputs["CognitoDomainUrl"],
+        outputs["MonitoringClientId"], os.environ["MONITORING_CLIENT_SECRET"], "incident-response/remediation.invoke",
+    )
 
     print("\n== (b) NATIVE AGENTCORE INVOKE -- InvokeAgentRuntime, raw payload, no A2A layer ==")
-    b_samples, b_result = pattern_b_native_invoke(client, remediation_arn)
+    b_samples, b_result = pattern_b_native_invoke(region, remediation_arn, token)
     report("native invoke", b_samples)
     print(f"  sample output: {b_result[:160]}")
 
-    print("\n== (c) FULL A2A PROTOCOL -- GetAgentCard + OAuth + JSON-RPC message/send ==")
-    token = get_client_credentials_token(
-        outputs["DiscoveryUrl"].replace("/.well-known/openid-configuration", ""),
-        outputs["MonitoringClientId"], os.environ["MONITORING_CLIENT_SECRET"], "incident-response/remediation.invoke",
-    )
-    c_samples, c_result = pattern_c_full_a2a(client, remediation_arn, token)
+    print("\n== (c) FULL A2A PROTOCOL -- agent-card discovery + OAuth + JSON-RPC message/send ==")
+    c_samples, c_result = pattern_c_full_a2a(region, remediation_arn, token)
     report("full A2A", c_samples)
     print(f"  sample agent-card + response: {str(c_result)[:160]}")
 
