@@ -1,6 +1,15 @@
 bedrock-agentcore>=0.1.0
 strands-agents>=0.1.0
 strands-agents-tools>=0.1.0
+# strands.multiagent.a2a.server.A2AServer imports the a2a-sdk package itself -- it was
+# MISSING here the whole time (this repo's first build never actually sent a real A2A
+# message/send to the monitoring runtime, only to remediation's, so the gap was latent).
+# Caught for real 2026-10-22 when this build's new pattern-(c)-real path became the first
+# one to ever invoke the monitoring runtime over A2A: it 500'd with
+# "ModuleNotFoundError: No module named 'a2a'". Pinned to match remediation_agent's
+# requirements.txt -- same reason: a2a-sdk 1.x removed the A2AStarletteApplication module
+# this code (and Strands' own A2A integration) is written against.
+a2a-sdk[http-server]==0.3.26
 boto3>=1.35.0
 uvicorn>=0.30.0
 fastapi>=0.115.0

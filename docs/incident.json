@@ -1,0 +1,15 @@
+{
+  "alarm_name": "a2a-incident-demo-checkout-api-test-errors",
+  "namespace": "A2AIncidentDemo",
+  "metric_name": "SyntheticErrorRate",
+  "dimension_name": "Service",
+  "dimension_value": "checkout-api-test",
+  "threshold": 80.0,
+  "pushed_test_value": 97.0,
+  "region": "us-east-1",
+  "account": "129875820670",
+  "state_updated_timestamp_aws": "2026-10-22T13:42:45.354000+11:00",
+  "state_reason_aws": "Threshold Crossed: 1 datapoint [97.0 (22/10/26 02:42:20)] was greater than the threshold (80.0).",
+  "observed_by_incident_script_at_laptop_clock": "2026-10-22T02:42:49.336278+00:00",
+  "torn_down": true
+}

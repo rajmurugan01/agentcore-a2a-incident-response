@@ -104,6 +104,51 @@ export class A2AIncidentResponseStack extends cdk.Stack {
     monitoringImage.repository.grantPull(monitoringRole);
     remediationImage.repository.grantPull(remediationRole);
 
+    // ── AgentCore Identity: outbound-auth credential provider (approval condition 2,
+    // 2026-10-22) ──────────────────────────────────────────────────────────────────
+    // The monitoring agent now makes the agent-to-agent hand-off itself (see
+    // MonitoringCrossInvokePolicy below) and needs its OWN Cognito client-credentials
+    // token to do it -- never a plaintext secret in its code, env, or container image.
+    // Verified for real against this build's botocore (bedrock-agentcore-control
+    // CreateOauth2CredentialProvider shape) and CDK (aws-bedrockagentcore L1) models
+    // during this session, per docs/specs/agentcore-a2a-incident-response.md's condition
+    // 2: a CfnOAuth2CredentialProvider with credentialProviderVendor "CognitoOauth2" (a
+    // named enum value, confirmed in the live botocore model -- there is no separately
+    // modelled CognitoOauth2ProviderConfigInput struct, so it pairs with the generic
+    // includedOauth2ProviderConfig shape, which takes issuer/authorizationEndpoint/
+    // tokenEndpoint explicitly) is the right fit. The client SECRET is supplied to this
+    // ONE create call via UserPoolClient.userPoolClientSecret -- CDK's own
+    // deploy-time-resolved SecretValue for the secret Cognito generates, never a literal
+    // in this file -- and AgentCore Identity stores it in its own vault from that point
+    // on; the running monitoring_agent container fetches a fresh access token at call
+    // time via GetResourceOauth2Token (wrapped by the bedrock_agentcore SDK's
+    // @requires_access_token(..., auth_flow="M2M") decorator in agent.py), and never
+    // reads a secret from os.environ.
+    //
+    // Cognito's OAuth2 token endpoint lives on the hosted-UI domain, NOT the issuer URL
+    // the discovery document advertises (the same gotcha CognitoDomainUrl below exists
+    // to work around for demo.py) -- so issuer/authorizationEndpoint/tokenEndpoint are
+    // given explicitly here instead of relying on discoveryUrl resolution.
+    const cognitoIssuer = `https://cognito-idp.${this.region}.amazonaws.com/${pool.userPoolId}`;
+    const monitoringToRemediationCredentialProvider = new agentcore.CfnOAuth2CredentialProvider(
+      this, 'MonitoringToRemediationCredentialProvider', {
+        name: 'monitoring-to-remediation-cognito',
+        credentialProviderVendor: 'CognitoOauth2',
+        oauth2ProviderConfigInput: {
+          includedOauth2ProviderConfig: {
+            clientId: monitoringClient.userPoolClientId,
+            clientSecret: monitoringClient.userPoolClientSecret.unsafeUnwrap(),
+            issuer: cognitoIssuer,
+            authorizationEndpoint: `${domain.baseUrl()}/oauth2/authorize`,
+            tokenEndpoint: `${domain.baseUrl()}/oauth2/token`,
+          },
+        },
+      },
+    );
+    // The GetResourceOauth2Token IAM grant is added further down, AFTER monitoringRuntime
+    // exists -- see the comment there for why the resource ARN it needs is NOT this
+    // credential provider's own ARN (a real finding from this build, not an assumption).
+
     // Monitoring agent's actual job: read CloudWatch logs/metrics/alarms. Read-only --
     // it is a monitoring agent, not a remediation one.
     monitoringRole.addToPolicy(new iam.PolicyStatement({
@@ -128,23 +173,10 @@ export class A2AIncidentResponseStack extends cdk.Stack {
     const remediationDefaultPolicy = remediationRole.node.findChild('DefaultPolicy');
 
     // ── AgentCore Runtimes, both in A2A-server protocol mode ────────────────────
-    const monitoringRuntime = new agentcore.CfnRuntime(this, 'MonitoringRuntime', {
-      agentRuntimeName: 'monitoring_agent_a2a',
-      description: 'Strands CloudWatch monitoring/incident-finding agent, A2A server',
-      roleArn: monitoringRole.roleArn,
-      protocolConfiguration: 'A2A',
-      agentRuntimeArtifact: { containerConfiguration: { containerUri: monitoringImage.imageUri } },
-      authorizerConfiguration: {
-        customJwtAuthorizer: { discoveryUrl, allowedClients: [monitoringClient.userPoolClientId, remediationClient.userPoolClientId] },
-      },
-      // Required by the service; the CFN/CDK type is non-optional too (checked directly
-      // against aws-cdk-lib's generated types). First deploy attempt just missed it --
-      // failed with "NetworkConfiguration is required" until this was added.
-      networkConfiguration: { networkMode: 'PUBLIC' },
-      environmentVariables: { AWS_REGION: this.region },
-    });
-    if (monitoringDefaultPolicy) monitoringRuntime.node.addDependency(monitoringDefaultPolicy);
-
+    // Remediation created FIRST: the monitoring runtime's own environmentVariables now
+    // need remediation's ARN (for the agent-to-agent hand-off tool in monitoring/agent.py),
+    // so remediation's CfnRuntime construct has to exist before monitoring's prop object
+    // is built, not just before monitoring's dependency/policy wiring below.
     const remediationRuntime = new agentcore.CfnRuntime(this, 'RemediationRuntime', {
       agentRuntimeName: 'remediation_agent_a2a',
       description: 'LangGraph runbook-lookup remediation agent, A2A server',
@@ -154,10 +186,77 @@ export class A2AIncidentResponseStack extends cdk.Stack {
       authorizerConfiguration: {
         customJwtAuthorizer: { discoveryUrl, allowedClients: [monitoringClient.userPoolClientId, remediationClient.userPoolClientId] },
       },
+      // Required by the service; the CFN/CDK type is non-optional too (checked directly
+      // against aws-cdk-lib's generated types). First deploy attempt just missed it --
+      // failed with "NetworkConfiguration is required" until this was added.
       networkConfiguration: { networkMode: 'PUBLIC' },
       environmentVariables: { AWS_REGION: this.region },
     });
     if (remediationDefaultPolicy) remediationRuntime.node.addDependency(remediationDefaultPolicy);
+
+    const monitoringRuntime = new agentcore.CfnRuntime(this, 'MonitoringRuntime', {
+      agentRuntimeName: 'monitoring_agent_a2a',
+      description: 'Strands CloudWatch monitoring/incident-finding agent, A2A server',
+      roleArn: monitoringRole.roleArn,
+      protocolConfiguration: 'A2A',
+      agentRuntimeArtifact: { containerConfiguration: { containerUri: monitoringImage.imageUri } },
+      authorizerConfiguration: {
+        customJwtAuthorizer: { discoveryUrl, allowedClients: [monitoringClient.userPoolClientId, remediationClient.userPoolClientId] },
+      },
+      networkConfiguration: { networkMode: 'PUBLIC' },
+      environmentVariables: {
+        AWS_REGION: this.region,
+        // Agent-to-agent hand-off (Tier 1 criterion, 2026-10-22): the monitoring agent
+        // fetches remediation's card and sends message/send itself. None of these three
+        // values are secrets -- the credential provider NAME is just an identifier the
+        // agent passes to AgentCore Identity's GetResourceOauth2Token at call time; the
+        // actual Cognito client secret lives only in the credential provider's own vault
+        // (see MonitoringToRemediationCredentialProvider above), never here.
+        REMEDIATION_RUNTIME_ARN: remediationRuntime.attrAgentRuntimeArn,
+        OAUTH2_CREDENTIAL_PROVIDER_NAME: monitoringToRemediationCredentialProvider.name,
+        REMEDIATION_SCOPE: `${RESOURCE_SERVER_ID}/remediation.invoke`,
+      },
+    });
+    if (monitoringDefaultPolicy) monitoringRuntime.node.addDependency(monitoringDefaultPolicy);
+
+    // Real finding from this build, confirmed against FOUR successive live
+    // AccessDeniedException messages (2026-10-22), each naming a DIFFERENT exact resource
+    // ARN as the one denied (IAM's deny message only ever reports the first unauthorized
+    // resource it hits in a multi-resource action, not every one the action touches):
+    // the credential provider ARN, the workload identity ARN, the workload identity
+    // DIRECTORY ARN, and finally the TOKEN VAULT ARN one level up from the credential
+    // provider. GetResourceOauth2Token clearly touches a whole resource hierarchy
+    // (token-vault -> oauth2credentialprovider, workload-identity-directory ->
+    // workload-identity), not one resource -- rather than keep enumerating exact ARNs one
+    // deny at a time, this grants the two parent namespaces with a wildcard, which covers
+    // every resource under both in one statement.
+    new iam.Policy(this, 'MonitoringOutboundAuthPolicy', {
+      roles: [monitoringRole],
+      statements: [
+        new iam.PolicyStatement({
+          actions: ['bedrock-agentcore:GetResourceOauth2Token'],
+          resources: [
+            `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/*`,
+            `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/*`,
+          ],
+        }),
+        // A FIFTH deny, past all four bedrock-agentcore ones above: AgentCore Identity
+        // stores the credential provider's client secret as an actual AWS Secrets
+        // Manager secret (name convention confirmed live:
+        // "bedrock-agentcore-identity!default/oauth2/<provider-name>-<random-suffix>"),
+        // and GetResourceOauth2Token reads it using the CALLING ROLE's own IAM identity,
+        // not an AgentCore-internal service role -- so the monitoring role ALSO needs
+        // secretsmanager:GetSecretValue on that secret directly. The random suffix is
+        // only known after the credential provider is created, so this is a prefix
+        // wildcard rather than an exact ARN.
+        new iam.PolicyStatement({
+          actions: ['secretsmanager:GetSecretValue'],
+          resources: [
+            `arn:aws:secretsmanager:${this.region}:${this.account}:secret:bedrock-agentcore-identity!default/oauth2/${monitoringToRemediationCredentialProvider.name}*`,
+          ],
+        }),
+      ],
+    });
 
     // ── Cross-runtime invoke, pattern (b): the InvokeAgentRuntime data-plane call is a
     // DISTINCT primitive from the A2A JSON-RPC envelope -- it exists regardless of
@@ -202,5 +301,6 @@ export class A2AIncidentResponseStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'RemediationClientId', { value: remediationClient.userPoolClientId });
     new cdk.CfnOutput(this, 'MonitoringRuntimeArn', { value: monitoringRuntime.attrAgentRuntimeArn });
     new cdk.CfnOutput(this, 'RemediationRuntimeArn', { value: remediationRuntime.attrAgentRuntimeArn });
+    new cdk.CfnOutput(this, 'OAuth2CredentialProviderArn', { value: monitoringToRemediationCredentialProvider.attrCredentialProviderArn });
   }
 }

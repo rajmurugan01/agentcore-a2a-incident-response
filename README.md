@@ -14,17 +14,34 @@ rajmurugan.com LangGraph-vs-AgentCore post instead of a new OpenAI API key), and
 static runbook knowledge source instead of JIRA ticketing or Tavily web search. No new
 paid third-party API signups.
 
-## Status: deployed, measured, and torn down -- 2026-10-21
+## Status: the incident is real now -- fixed, deployed, measured, torn down (2026-10-22)
 
-The stack deployed for real on 2026-10-21 (Cognito user pool, two ECR images, two
-`AWS::BedrockAgentCore::Runtime` A2A servers in `us-east-1`, account `129875820670`), all
-three comms patterns ran for real (5 runs each) against the live runtimes, and the
-numbers below are copied from `docs/transcript.txt`. Getting there took several
-genuinely separate bugs, none of them hypothetical -- see "Sharp edges I hit" below; the
-first deploy attempt alone needed four of them fixed before `cdk deploy` produced two
-runtimes in `READY` state. The stack was torn down after the transcript was captured
-(`make destroy`), and teardown was verified afterwards, not just trusted from the exit
-code -- see "Teardown" at the end of this README for exactly what was checked.
+The 2026-10-21 build measured A2A transport mechanics for real but faked the "incident"
+in "incident response": a hardcoded string was fed to both agents, and the hand-off was
+scripted by the demo harness rather than done agent-to-agent. An evidence review caught
+this before the blog post was rewritten (see `docs/specs/agentcore-a2a-incident-response.md`
+for the full reasoning) and this session fixed it for real, against a live redeploy:
+
+- `make incident` creates a real, tagged CloudWatch metric + alarm and drives it into
+  `ALARM` for real (not a hardcoded string).
+- The monitoring agent's own CloudWatch tools detect it for real -- 5/5 runs, 100%,
+  checked against `describe-alarms`/`get-metric-statistics` each time, never retried on a
+  miss.
+- The monitoring agent itself -- not the demo harness -- fetches the remediation agent's
+  card and sends `message/send` with its own OAuth token, obtained through AgentCore
+  Identity's outbound-auth credential provider (no Cognito client secret in its code, env,
+  or image).
+
+All 20 measured runs (5 each: direct-call baseline, native-invoke baseline, a TEST_FINDING
+control run for like-for-like comparison with 2026-10-21, and the real detect+hand-off
+path) are in `docs/transcript.txt`. The stack was torn down afterwards and independently
+verified gone -- see "Teardown". See "Sharp edges I hit (2026-10-22)" below for what this
+took: outbound auth worked, but needed five IAM iterations against five different live
+AccessDeniedException messages, plus two unrelated real bugs this session's new A2A path
+was the first thing to ever surface.
+
+The 2026-10-21 deploy's own history is kept below for the transport-measurement findings,
+which are still valid and unchanged.
 
 ## The idea in one diagram
 
@@ -38,11 +55,16 @@ flowchart LR
 
 ## What it's built to show
 
-| # | Pattern | What it measures |
-|---|---------|-------------------|
-| a | Direct call | One process, both agents' functions, no AgentCore hop at all |
-| b | AgentCore-native invoke | `InvokeAgentRuntime` with a raw JSON payload -- bypasses agent-card discovery and the A2A JSON-RPC envelope |
-| c | Full A2A protocol | `GetAgentCard` discovery, a Cognito client-credentials token, then a JSON-RPC 2.0 `message/send` through the same `InvokeAgentRuntime` call |
+| # | Pattern | What it measures | Hand-off driven by |
+|---|---------|-------------------|---------------------|
+| a | Direct call | One process, both agents' functions, no AgentCore hop at all | `demo.py` (TEST_FINDING) |
+| b | AgentCore-native invoke | `InvokeAgentRuntime` with a raw JSON payload -- bypasses agent-card discovery and the A2A JSON-RPC envelope | `demo.py` (TEST_FINDING) |
+| c (control) | Full A2A protocol, TEST_FINDING | Like-for-like comparison with the 2026-10-21 numbers | `demo.py` fetches remediation's card and sends `message/send` itself (the OLD, pre-fix method) |
+| c (real) | Full A2A protocol, real incident | The actual agent-to-agent hand-off | the MONITORING AGENT ITSELF fetches remediation's card and sends `message/send` with its own OAuth token -- `demo.py` only triggers the run by messaging the monitoring runtime |
+
+Patterns (a) and (b) are unchanged transport baselines -- they exist to measure raw
+transport cost, not hand-off realism, so they still use the scripted `TEST_FINDING`
+string on purpose (see `docs/specs/agentcore-a2a-incident-response.md`).
 
 **A genuine finding, confirmed against the live deploy, not just the botocore model:** the
 task behind this repo asked whether AgentCore has a cross-runtime invoke primitive
@@ -139,83 +161,170 @@ prior session -- they're the actual texture of standing up a brand-new AWS servi
 (AgentCore Runtime, GA'd 2025) end to end: several real, narrow, individually-googleable
 bugs, not one dramatic blocker.
 
+## Sharp edges I hit (2026-10-22)
+
+Fixing the fake-incident problem surfaced sharp edges in a completely different part of
+the stack: AgentCore Identity's outbound-auth credential-provider mechanism (approval
+condition 2), which this build was the first to actually exercise, plus two real bugs in
+the monitoring runtime's A2A server that the 2026-10-21 build never triggered because it
+never actually sent the monitoring runtime a real A2A message.
+
+1. **A Makefile region-pinning bug, caught by its own safety net before it did real
+   damage.** The region pin was `export AWS_REGION ?= us-east-1` -- a no-op when the
+   calling shell already exports `AWS_REGION` (mine did, to `ap-southeast-2`). `make
+   incident`'s first run created the test alarm in the WRONG region entirely, because
+   `?=` silently deferred to the shell's existing value. Caught immediately because
+   `scripts/incident.py` prints the region it's using -- fixed to an unconditional `:=`
+   so this can't recur.
+2. **`monitoring_agent`'s container never actually had `a2a-sdk` installed.** Latent
+   since the first build: `strands.multiagent.a2a.server.A2AServer` imports `a2a-sdk`
+   itself, but `agents/monitoring_agent/requirements.txt` never listed it (only
+   `remediation_agent`'s did) -- invisible the whole time because the 2026-10-21 build
+   never sent a real A2A `message/send` to the monitoring runtime, only to remediation's.
+   This session's new pattern-(c)-real path was the first thing to ever invoke it, and it
+   500'd with `ModuleNotFoundError: No module named 'a2a'`. Fixed by adding the same pin
+   remediation already had: `a2a-sdk[http-server]==0.3.26`.
+3. **Strands' `A2AServer` doesn't extract AgentCore's per-request workload-access-token
+   header, so outbound auth found nothing to use.** AgentCore Runtime passes a
+   `WorkloadAccessToken` header on every inbound A2A request; AWS's own
+   `bedrock_agentcore.runtime.a2a.BedrockCallContextBuilder` extracts it into
+   `BedrockAgentCoreContext` for exactly this reason, but Strands builds its
+   `A2AStarletteApplication` without wiring that hook in. Without it,
+   `@requires_access_token` found no workload token in context, assumed it was running
+   locally, and tried to CREATE a workload identity -- which the monitoring role
+   correctly does NOT have permission to do, so the hand-off 500'd with
+   `AccessDeniedException` on `bedrock-agentcore:CreateWorkloadIdentity`. Fixed with a
+   small FastAPI middleware in `monitoring_agent/agent.py` that reads the
+   `WorkloadAccessToken` header itself and sets it on `BedrockAgentCoreContext`.
+4. **`GetResourceOauth2Token`'s IAM authorization touches FOUR separate resources, and
+   the deny message only ever reports the first one it hits.** Granting the credential
+   provider's own ARN (the obvious first guess) got `AccessDeniedException` naming the
+   runtime's auto-created workload-identity ARN instead; granting that got denied naming
+   the workload-identity-DIRECTORY ARN; granting that got denied naming the token-vault
+   ARN. Five live deploy-and-retry cycles, each one driven by the literal exception text
+   pulled from CloudWatch Logs (via a `token_fetch_FAILED` debug log line added
+   specifically to see it), not by re-guessing from docs. Fixed with two wildcard grants
+   (`token-vault/*`, `workload-identity-directory/*`) rather than keep enumerating exact
+   ARNs.
+5. **AgentCore Identity stores the credential provider's client secret as an actual AWS
+   Secrets Manager secret, and the CALLING ROLE needs `secretsmanager:GetSecretValue` on
+   it directly -- not an AgentCore-internal service role.** The fifth and final deny:
+   `Access denied when retrieving secret
+   'arn:aws:secretsmanager:...:secret:bedrock-agentcore-identity!default/oauth2/
+   monitoring-to-remediation-cognito-<suffix>'`. This is a genuinely new finding, not
+   documented anywhere this build checked beforehand: `GetResourceOauth2Token` reads the
+   secret using the caller's own SigV4 identity, so the monitoring role needed an
+   explicit `secretsmanager:GetSecretValue` grant scoped to that secret's name prefix.
+   Once added, the live hand-off succeeded end to end with zero secrets in
+   `monitoring_agent`'s code, env, or image -- see `cdk/lib/stack.ts`'s
+   `MonitoringOutboundAuthPolicy` for the full, now-correct grant and the inline history
+   of what each wrong guess actually said.
+
 ## How it works
 
 - `cdk/` -- CDK (TypeScript) stack: one Cognito user pool with a resource server and two
   client-credentials app clients (one per agent, each scoped only to invoke the *other*
   agent, never itself), two container images built and pushed as CDK assets
-  (`DockerImageAsset`, `linux/arm64` -- AgentCore Runtime's required architecture), and
-  two `AWS::BedrockAgentCore::Runtime` resources in `ProtocolConfiguration: A2A` mode,
-  each behind the shared Cognito discovery URL as a custom JWT authorizer.
+  (`DockerImageAsset`, `linux/arm64` -- AgentCore Runtime's required architecture), two
+  `AWS::BedrockAgentCore::Runtime` resources in `ProtocolConfiguration: A2A` mode each
+  behind the shared Cognito discovery URL as a custom JWT authorizer, and (added
+  2026-10-22) one `AWS::BedrockAgentCore::OAuth2CredentialProvider` (`CognitoOauth2`
+  vendor) that stores the monitoring client's Cognito secret -- resolved via
+  `UserPoolClient.userPoolClientSecret`, never a literal -- so the monitoring agent can
+  fetch its own hand-off token at call time instead of reading a secret from its
+  environment. See `MonitoringOutboundAuthPolicy` for the real IAM surface this needed
+  (five iterations; see "Sharp edges I hit (2026-10-22)").
 - `agents/monitoring_agent/` -- Strands SDK agent with local CloudWatch tools (alarms,
   metrics, log filtering), wrapped by `strands.multiagent.a2a.server.A2AServer` --
   reusing the real pattern from the AWS sample's `monitoring_agent.py`, minus the
-  Gateway/Memory/Identity primitives (out of scope here; see below).
-  `find_incidents_direct()` is the same logic exposed bare, for comms pattern (a).
+  Gateway/Memory primitives (out of scope here; see below). `find_incidents_direct()` is
+  the same logic exposed bare (not used by any measured comms pattern, kept for manual
+  verification). `handoff_to_remediation_agent` (added 2026-10-22) is a Strands `@tool`
+  the agent calls itself, once it has a real, tool-confirmed finding: it fetches an OAuth
+  token via `@requires_access_token(..., auth_flow="M2M")` (AgentCore Identity outbound
+  auth), then does the real `GetAgentCard` + `message/send` against the remediation
+  runtime -- this is the actual agent-to-agent hand-off, not `demo.py`. A small FastAPI
+  middleware extracts AgentCore's `WorkloadAccessToken` request header into
+  `BedrockAgentCoreContext` (Strands' own `A2AServer` doesn't do this -- see sharp edges)
+  and logs a structured `STEP` line with a real UTC timestamp at every stage (detection,
+  token fetch, card fetch, hand-off send, model token usage) for the hero timeline.
 - `agents/remediation_agent/` -- LangGraph graph (classify finding -> match a local
   `runbooks.json` entry -> ask the model for a grounded recommendation), wrapped directly
   with the `a2a-sdk`'s `AgentExecutor` / `A2AStarletteApplication` primitives, since
   LangGraph has no built-in A2A server the way Strands does. `remediate_direct()` is the
   same graph exposed bare, for comms pattern (a). `a2a-sdk` is pinned to `0.3.26`
-  (`a2a-sdk[http-server]==0.3.26`), not a loose `>=`: the PyPI-default 1.x line removed the
-  `A2AStarletteApplication` module this code (and AWS's own sample) is written against.
-- `demo/demo.py` -- runs all three comms patterns `RUNS_PER_PATTERN` times each against
-  the real deployed stack, prints min/median/max latency per pattern, and prints the cost
-  formula (measured call counts x published list-price rates) rather than a precomputed
-  number -- see Cost below. Pattern (a) imports both agents' `agent.py` modules
-  in-process on the machine running `demo.py`, not inside their containers, so `make
-  install` provisions a `.venv` (Python 3.12, matching the Dockerfiles) with both agents'
-  full dependency sets -- plain system Python doesn't have strands/langgraph/a2a-sdk
-  installed, and several of those packages don't yet support the Homebrew default
-  Python 3.14.
+  (`a2a-sdk[http-server]==0.3.26`) in BOTH agents' requirements now -- it was missing
+  entirely from `monitoring_agent`'s until 2026-10-22 (see sharp edges); the PyPI-default
+  1.x line removed the `A2AStarletteApplication` module this code (and AWS's own sample)
+  is written against, so a loose `>=` pin is wrong for either agent.
+- `scripts/incident.py` / `scripts/teardown_incident.py` (added 2026-10-22) -- create and
+  tear down the real, tagged test CloudWatch metric + alarm `make incident`/`make
+  destroy` drive. See inline comments for why `TreatMissingData=ignore` and a 10s
+  high-resolution period were chosen.
+- `demo/demo.py` -- runs all four comms patterns (a, b, c-control, c-real)
+  `RUNS_PER_PATTERN` times each against the real deployed stack, checks each pattern-(c)-
+  real run's finding against ground truth (`describe-alarms`/`get-metric-statistics`,
+  never retried on a miss), picks the pre-declared MEDIAN pattern-(c)-real run by total
+  duration as the hero timeline (decided by a sort, before any run's content is read),
+  and pulls that run's real container-log STEP lines from CloudWatch Logs to build it.
+  Pattern (a) imports both agents' `agent.py` modules in-process on the machine running
+  `demo.py`, not inside their containers, so `make install` provisions a `.venv` (Python
+  3.12, matching the Dockerfiles) with both agents' full dependency sets -- plain system
+  Python doesn't have strands/langgraph/a2a-sdk/bedrock-agentcore installed, and several
+  of those packages don't yet support the Homebrew default Python 3.14.
 
 ## Not in scope
 
-AgentCore Gateway, Memory, Identity (beyond the workload-access-token calls Runtime
-makes for you) and Observability primitives from the AWS sample -- this repo only
-exercises Runtime + the A2A protocol layer, by design (see the task scope this was built
-against). Not a production reference architecture: no VPC isolation, no WAF in front of
-the Cognito domain, no secret rotation. Not the AWS sample 1:1 -- no Google ADK host
-agent, no JIRA, no Tavily. The `a2a-sdk` wiring in `remediation_agent/agent.py` follows
-the library's documented `AgentExecutor` contract and has now been exercised end to end
-against a live AgentCore Runtime (see Status) -- agent-card retrieval and `message/send`
-both returned real, correct responses.
+AgentCore Gateway, Memory, and Observability primitives from the AWS sample -- this repo
+only exercises Runtime, the A2A protocol layer, and (as of 2026-10-22) AgentCore
+Identity's outbound-auth credential-provider mechanism specifically for the
+agent-to-agent hand-off, by design (see the task scope this was built against). Not a
+production reference architecture: no VPC isolation, no WAF in front of the Cognito
+domain, no secret rotation. Not the AWS sample 1:1 -- no Google ADK host agent, no JIRA,
+no Tavily. Tier 2 (human-approved, Gateway+Cedar-policy-enforced reversible remediation)
+remains proposed-only in the spec, not built.
 
 ## Cost
 
-### Measured (from this session's final `make demo` run, 5 runs/pattern)
+### Measured (2026-10-22, final `make demo` run, 5 runs/pattern -- `docs/transcript.txt`)
 
 | Pattern | n | min | median | max |
 |---|---|---|---|---|
-| (a) direct call | 5 | 2.480s | 2.637s | 4.568s |
-| (b) native invoke (raw payload) | 5 | 8.246s | 8.423s | 8.593s |
-| (c) full A2A | 5 | 18.699s | 19.116s | 20.970s |
+| (a) direct call (TEST_FINDING) | 5 | 2.193s | 2.401s | 2.822s |
+| (b) native invoke, raw payload (TEST_FINDING) | 5 | 8.231s | 8.359s | 8.479s |
+| (c) full A2A -- CONTROL (TEST_FINDING, client-driven, old method) | 5 | 18.590s | 18.831s | 19.024s |
+| (c) full A2A -- REAL (real detection + real agent-to-agent hand-off) | 5 | 23.741s | 25.270s | 26.418s |
 
-Full raw output: [`docs/transcript.txt`](docs/transcript.txt).
+Detection success rate on the real runs: **5/5 (100%)**, each checked against
+`describe-alarms`/`get-metric-statistics` directly, never retried on a miss.
+
+The (c)-control number (median 18.831s) is consistent with the 2026-10-21 run's 19.116s,
+as expected for an unchanged code path -- it's kept only for that comparison, see "What
+it's built to show". The real path's extra ~6.4s over the control is the monitoring
+agent's own detection reasoning (CloudWatch tool calls + a Bedrock call) PLUS its own
+token fetch, which the control path skips entirely (the control never calls the
+monitoring runtime at all). The hero timeline for the pre-declared median real run
+(`real-1`, 25.270s) is in `docs/transcript.txt`, built from real container-log STEP lines
+pulled from CloudWatch Logs for both runtimes, anchored to that run's own
+request-start/request-done pair so it can't bleed in events from an adjacent run (these 5
+runs execute back-to-back with no idle gap, which this build's first `make demo` attempt
+actually hit -- see `demo.py`'s `fetch_container_log_events`/anchor logic).
 
 Pattern (b)'s 5 calls never reach the model: as the finding above describes, the
 remediation container is a pure A2A JSON-RPC server and rejects pattern (b)'s raw,
 non-A2A payload as a validation error before any LangGraph/Bedrock call happens -- its
-~8.2-8.6s is pure AgentCore Runtime + Cognito-auth round-trip latency, not model latency,
-and its $0 model cost below is real, not a placeholder. Pattern (c)'s extra ~11s over (b)
-is the `GetAgentCard`-equivalent discovery GET plus, unlike (b), an actual LangGraph run
-(classify -> Bedrock call -> format) that gets far enough to return a real
-recommendation.
+~8.2-8.5s is pure AgentCore Runtime + Cognito-auth round-trip latency, not model latency.
 
-Pulled from this session's real `AWS/Bedrock` CloudWatch metrics (`InputTokenCount` /
-`OutputTokenCount` / `Invocations`, dimensioned by `ModelId`), covering every real model
-call made while validating and measuring this stack (one ad hoc validation call, a 5-run
-pattern-(a) dry run, and the two full `make demo` runs -- the first with a now-corrected
-pricing comment, the second the one in `docs/transcript.txt`; pattern (b)'s calls are not
-in this count, since they make zero model calls, see above): **27 invocations, 5,398 input
-tokens, 4,215 output tokens**, which at the list rates below is
-**$0.0054 + $0.0211 = $0.0265 total**, or roughly $0.001 per model-invoking call. This is
-the session aggregate, not isolated to one `make demo` run -- CloudWatch's per-minute
-granularity couldn't cleanly separate the two runs' calls from each other once I checked,
-and reporting the honest aggregate beats a precise-looking number I couldn't actually
-back up. AgentCore Runtime compute itself isn't separately measurable here -- that needs
-AgentCore Observability enabled, which is explicitly out of scope for this repo (see "Not
-in scope") -- so that part of the bill is list-price-derived only, below.
+Session total, pulled from this session's real `AWS/Bedrock` CloudWatch usage metrics
+(`InputTokenCount`/`OutputTokenCount`, dimensioned by `ModelId`), covering every real
+model call made across deploying, five IAM-fix redeploys, two full `make demo` runs (the
+first caught the log-window contamination bug and was superseded; both are real, measured
+spend), and destroy: **~$0.245 total** (160,419 input tokens + 16,889 output tokens at the
+list rates below), reported live by `demo.py` before and after each run against the
+$5 spend cap (never approached). AgentCore Runtime compute itself isn't separately
+measurable here -- that needs AgentCore Observability enabled, which is explicitly out of
+scope for this repo (see "Not in scope") -- so that part of the bill is list-price-derived
+only, below.
 
 ### List prices (cross-checked 2026-10-20/21, not AWS-account-specific)
 
@@ -236,9 +345,10 @@ in scope") -- so that part of the bill is list-price-derived only, below.
   figure during this build) -- re-verify there before relying on this for a real budget.
 - Cognito: free tier covers this demo's token volume; not priced further here.
 
-Total measured + list-price-derived cost for this entire session (deploy, the 27
-model-invoking calls above, destroy): well under $0.10, dominated by rounding in
-AgentCore Runtime compute's per-second billing, not by model inference.
+Total measured + list-price-derived cost for this entire 2026-10-22 session (deploy, five
+IAM-fix redeploys, `make incident`, two full `make demo` runs, `make destroy`): ~$0.245,
+still dominated by rounding in AgentCore Runtime compute's per-second billing and a
+handful of extra debugging model calls, not by anything structurally expensive.
 
 ## Run it
 
@@ -249,25 +359,45 @@ running, not just installed), and `AWS_PROFILE` set to an identity with permissi
 create Cognito, IAM, ECR and `AWS::BedrockAgentCore::*` resources.
 
     make install   # cdk/ npm install + a python3.12 .venv with both agents' full deps
-    make deploy    # Cognito, two ECR images (CDK assets), two AgentCore Runtimes, IAM
-    make demo      # runs the three comms patterns, writes docs/transcript.txt
-    make destroy   # removes everything
+    make deploy    # Cognito, two ECR images (CDK assets), two AgentCore Runtimes, IAM,
+                    # the OAuth2 credential provider
+    make incident  # creates a REAL tagged test CloudWatch metric + alarm, drives it
+                    # into ALARM for real, writes docs/incident.json (ground truth)
+    make demo      # runs all four comms patterns, writes docs/transcript.txt
+    make destroy   # removes the test alarm/metric AND the AgentCore/Cognito stack
 
-The Cognito client secret never appears in `cdk/cdk.outputs.json`; `make demo` fetches it
-live via `DescribeUserPoolClient` so it isn't sitting in a plaintext stack-outputs file.
+The region is pinned with an unconditional `:=` in the Makefile, not `?=` -- `make
+incident`'s first run in this session created the test alarm in the wrong region because
+`?=` deferred to the calling shell's own `AWS_REGION` (see "Sharp edges I hit
+(2026-10-22)"). If your shell exports `AWS_REGION` to something other than `us-east-1`,
+this Makefile now overrides it for every command it runs, on purpose.
+
+Neither Cognito client secret ever appears in `cdk/cdk.outputs.json`; `make demo` fetches
+both live via `DescribeUserPoolClient` so neither sits in a plaintext stack-outputs file.
+The monitoring agent's OWN hand-off token is never fetched this way at all -- it comes
+from AgentCore Identity's outbound-auth credential provider at call time, inside the
+running container (see "How it works").
 
 ## Teardown
 
-Verified after `make destroy` on 2026-10-21, not just trusted from its exit code:
+Verified after `make destroy` on 2026-10-22, not just trusted from exit codes:
 `aws cloudformation describe-stacks` for this stack returns `ValidationError: ... does not
-exist`, `aws bedrock-agentcore-control list-agent-runtimes` returns an empty list (both
-runtimes gone), and `aws cognito-idp list-user-pools` no longer lists this stack's pool
-(only pre-existing, unrelated pools from other projects in the same account remain). One
-thing `cdk destroy` deliberately does NOT remove: the CDK bootstrap's shared
-`cdk-hnb659fds-container-assets-<account>-<region>` ECR repository still holds the image
-layers this build pushed (~720MB across 6 images at last check) -- that repo is shared
-bootstrap infrastructure used by every CDK app in the account, not something this stack
-owns, so deleting it is out of scope for this repo's `make destroy` and wasn't done; its
-own lifecycle policy (set by `cdk bootstrap`) will expire old untagged images over time,
-and ECR storage at that size is on the order of $0.07/month if left indefinitely --
+exist`; `aws bedrock-agentcore-control list-agent-runtimes` and `list-oauth2-credential-
+providers` both return empty lists; `aws cognito-idp list-user-pools` no longer lists
+this stack's pool; `aws cloudwatch describe-alarms` for the test alarm name returns empty
+(deleted by `scripts/teardown_incident.py` before `cdk destroy` ran). One thing that is
+NOT removed, by design, and this is a real AWS limitation, not a gap in this repo's
+scripts: CloudWatch has **no delete-metric API at all** -- `list-metrics` still shows the
+test metric's metadata after teardown, and will keep doing so until it ages out of
+CloudWatch's own retention/visibility window; there is no action this repo (or anything
+else) can take to remove it sooner. Same honesty standard as the ECR note below: reported
+as what it actually is, not hidden.
+
+A second, unrelated thing `cdk destroy` deliberately does NOT remove: the CDK bootstrap's
+shared `cdk-hnb659fds-container-assets-<account>-<region>` ECR repository still holds the
+image layers these builds pushed across both sessions -- that repo is shared bootstrap
+infrastructure used by every CDK app in the account, not something this stack owns, so
+deleting it is out of scope for this repo's `make destroy` and wasn't done; its own
+lifecycle policy (set by `cdk bootstrap`) will expire old untagged images over time, and
+ECR storage at that size is on the order of $0.07/month if left indefinitely --
 immaterial next to everything else in this session's bill.

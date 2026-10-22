@@ -1,42 +1,83 @@
 ======================================================================
-AgentCore A2A incident-response: three comms patterns, measured
+AgentCore A2A incident-response: real detection + real hand-off, measured
 ======================================================================
 
-== (a) DIRECT CALL -- no AgentCore hop ==
-    run 1/5: 4.568s
-    run 2/5: 2.480s
-    run 3/5: 2.585s
-    run 4/5: 2.637s
-    run 5/5: 2.641s
-  direct: min=2.480s median=2.637s max=4.568s (n=5)
+Ground truth (docs/incident.json): alarm='a2a-incident-demo-checkout-api-test-errors' AWS StateUpdatedTimestamp=2026-10-22T13:42:45.354000+11:00
+
+Spend check before running: ~$0.1735 so far this session (in=116781 tok, out=11337 tok, list-price-derived). Cap: $5.0.
+
+== (a) DIRECT CALL -- UNCHANGED transport baseline (TEST_FINDING) ==
+    run 1/5: 2.822s
+    run 2/5: 2.193s
+    run 3/5: 2.418s
+    run 4/5: 2.401s
+    run 5/5: 2.318s
+  direct: min=2.193s median=2.401s max=2.822s (n=5)
   sample output: # Remediation Recommendation
 
 The 15-minute average CPU of 94% confirms this is sustained high utilization, not a transient spike, so immediate action is warran
 
-== (b) NATIVE AGENTCORE INVOKE -- InvokeAgentRuntime, raw payload, no A2A layer ==
-    run 1/5: 8.304s
-    run 2/5: 8.423s
-    run 3/5: 8.566s
-    run 4/5: 8.246s
-    run 5/5: 8.593s
-  native invoke: min=8.246s median=8.423s max=8.593s (n=5)
+== (b) NATIVE AGENTCORE INVOKE -- UNCHANGED transport baseline (TEST_FINDING) ==
+    run 1/5: 8.359s
+    run 2/5: 8.231s
+    run 3/5: 8.397s
+    run 4/5: 8.479s
+    run 5/5: 8.294s
+  native invoke: min=8.231s median=8.359s max=8.479s (n=5)
   sample output: b'{"error":{"code":-32600,"data":[{"type":"missing","loc":["method"],"msg":"Field required","input":{"finding":"CPUUtilization alarm on service checkout-api has b'
 
-== (c) FULL A2A PROTOCOL -- agent-card discovery + OAuth + JSON-RPC message/send ==
-    run 1/5: 19.000s
-    run 2/5: 19.116s
-    run 3/5: 19.490s
-    run 4/5: 18.699s
-    run 5/5: 20.970s
-  full A2A: min=18.699s median=19.116s max=20.970s (n=5)
+== (c) FULL A2A -- CONTROL: TEST_FINDING, client-driven (like-for-like with 2026-10-21) ==
+    run 1/5: 18.624s
+    run 2/5: 19.024s
+    run 3/5: 18.590s
+    run 4/5: 18.831s
+    run 5/5: 18.915s
+  full A2A (control): min=18.590s median=18.831s max=19.024s (n=5)
   sample agent-card + response: (b'{"capabilities":{"streaming":false},"defaultInputModes":["text"],"defaultOutputModes":["text"],"description":"Classifies a monitoring finding and recommends 
 
+== (c) FULL A2A -- REAL: monitoring agent detects + hands off itself ==
+    run 1/5: 23.741s -- detection PASS (alarm_name_present=True alarm_in_ALARM=True value_matches=True)
+      response: {'id': '1', 'jsonrpc': '2.0', 'result': {'artifacts': [{'artifactId': '49d895cf-830f-4c7e-a2c9-b183fcb6a595', 'name': 'agent_response', 'parts': [{'kind': 'text', 'text': "**FINDING: alarm=a2a-inciden
+    run 2/5: 25.270s -- detection PASS (alarm_name_present=True alarm_in_ALARM=True value_matches=True)
+      response: {'id': '1', 'jsonrpc': '2.0', 'result': {'artifacts': [{'artifactId': 'a0b92b31-e4f4-4774-98ba-38df5ac05d65', 'name': 'agent_response', 'parts': [{'kind': 'text', 'text': "**FINDING: alarm=a2a-inciden
+    run 3/5: 23.929s -- detection PASS (alarm_name_present=True alarm_in_ALARM=True value_matches=True)
+      response: {'id': '1', 'jsonrpc': '2.0', 'result': {'artifacts': [{'artifactId': 'cac65bec-28b9-4b79-a7b1-5d98aabaf572', 'name': 'agent_response', 'parts': [{'kind': 'text', 'text': '**FINDING: alarm=a2a-inciden
+    run 4/5: 26.418s -- detection PASS (alarm_name_present=True alarm_in_ALARM=True value_matches=True)
+      response: {'id': '1', 'jsonrpc': '2.0', 'result': {'artifacts': [{'artifactId': '34abdf7b-912e-47b9-a8b9-4ea42bba7fdc', 'name': 'agent_response', 'parts': [{'kind': 'text', 'text': '**FINDING: alarm=a2a-inciden
+    run 5/5: 25.398s -- detection PASS (alarm_name_present=True alarm_in_ALARM=True value_matches=True)
+      response: {'id': '1', 'jsonrpc': '2.0', 'result': {'artifacts': [{'artifactId': '4beb08f2-71ec-46b0-87b9-73b9a5609d0f', 'name': 'agent_response', 'parts': [{'kind': 'text', 'text': '**FINDING: alarm=a2a-inciden
+  full A2A (real): min=23.741s median=25.270s max=26.418s (n=5)
+  DETECTION SUCCESS RATE: 5/5 runs (100%) -- published as-is, no retries on misses.
+
+== HERO TIMELINE: pre-declared MEDIAN pattern-(c)-real run by total duration (real-1-8603178b, 25.270s) ==
+  monitoring log group: /aws/bedrock-agentcore/runtimes/monitoring_agent_a2a-i3bTqvBNdD-DEFAULT
+  remediation log group: /aws/bedrock-agentcore/runtimes/remediation_agent_a2a-gLfJpS6HCq-DEFAULT
+  laptop send (UTC):     2026-10-22T03:37:10.706895+00:00
+  monitoring container's first STEP ts: 2026-10-22T03:37:12.063688+00:00  (gap vs laptop send: +1.357s -- includes real network/queueing latency AND any clock skew, not separated; recorded as-is, not absorbed)
+    [2026-10-22T03:37:12.063688+00:00] (monitoring) runtime_request_start {'path': '/', 'method': 'POST'}
+    [2026-10-22T03:37:17.941126+00:00] (monitoring) token_fetch_start {'scope': 'incident-response/remediation.invoke', 'provider': 'monitoring-to-remediation-cognito'}
+    [2026-10-22T03:37:18.012018+00:00] (monitoring) token_fetch_done 
+    [2026-10-22T03:37:18.012245+00:00] (monitoring) card_fetch_start 
+    [2026-10-22T03:37:25.501464+00:00] (remediation) runtime_request_start {'path': '/.well-known/agent-card.json', 'method': 'GET'}
+    [2026-10-22T03:37:25.502100+00:00] (remediation) runtime_request_done {'path': '/.well-known/agent-card.json', 'status_code': 200}
+    [2026-10-22T03:37:25.522828+00:00] (monitoring) card_fetch_done {'card_bytes': 729}
+    [2026-10-22T03:37:25.523032+00:00] (monitoring) handoff_send_start {'finding': 'FINDING: alarm=a2a-incident-demo-checkout-api-test-errors metric_value=97.0'}
+    [2026-10-22T03:37:32.988863+00:00] (remediation) runtime_request_start {'path': '/', 'method': 'POST'}
+    [2026-10-22T03:37:32.992486+00:00] (remediation) classify_start {'finding': 'FINDING: alarm=a2a-incident-demo-checkout-api-test-errors metric_value=97.0'}
+    [2026-10-22T03:37:32.992580+00:00] (remediation) classify_done {'runbook_key': 'error_rate'}
+    [2026-10-22T03:37:32.993163+00:00] (remediation) recommend_start {'runbook_key': 'error_rate'}
+    [2026-10-22T03:37:34.589923+00:00] (remediation) recommend_done 
+    [2026-10-22T03:37:34.590062+00:00] (remediation) model_usage {'model_id': 'us.anthropic.claude-haiku-4-5-20251001-v1:0', 'input_tokens': 178, 'output_tokens': 138, 'total_tokens': 316}
+    [2026-10-22T03:37:34.592781+00:00] (remediation) runtime_request_done {'path': '/', 'status_code': 200}
+    [2026-10-22T03:37:34.611791+00:00] (monitoring) handoff_send_done {'response_bytes': 833}
+    [2026-10-22T03:37:35.757367+00:00] (monitoring) model_usage {'model_id': 'us.anthropic.claude-haiku-4-5-20251001-v1:0', 'input_tokens': 9027, 'output_tokens': 719, 'total_tokens': 9746}
+    [2026-10-22T03:37:35.759658+00:00] (monitoring) runtime_request_done {'path': '/', 'status_code': 200}
+  laptop recv (UTC):     2026-10-22T03:37:35.974267+00:00
+
 == Cost: measured call counts x published list prices (see demo.py constants) ==
-  Runs this session: 5 direct, 5 native-invoke, 5 full-A2A
+  Runs this invocation: 5 direct, 5 native-invoke, 5 full-A2A-control, 5 full-A2A-real
   AgentCore Runtime compute: billed per second of actual vCPU+memory consumption,
   1-second minimum, at $0.0895/vCPU-hour + $0.00945/GB-hour (v1 list price).
-  Model cost per call depends on actual measured token counts, not estimated here --
-  pull them from this run's CloudWatch GetMetricData / Bedrock invocation logs and
-  multiply by $0.001/1K input + $0.005/1K output tokens (list price).
+  Spend estimate after this run (session window, list-price-derived): ~$0.2449 (in=160419 tok, out=16889 tok)
 
 Done.

@@ -1,5 +1,6 @@
 # Spec: AgentCore A2A cross-framework incident-response demo
-Status: draft (pending approval -- do not build Tier 1 or Tier 2 until Raj signs off)
+Status: Tier 1 shipped and verified live 2026-10-22 (see "Tier 1 fix session note" below).
+Tier 2 remains proposed only -- not approved, not built.
 Date: 2026-10-19, revised 2026-10-22   Domain: Professional (public companion repo for rajmurugan.com)
 Repo: agentcore-a2a-incident-response
 
@@ -58,45 +59,80 @@ build session needs the why, not just the checklist:
 
 Replacement criteria (supersede the round-1 list above):
 
-- [ ] `make incident` creates a tagged test metric (`put_metric_data`) and alarm, and drives it
-      into `ALARM`.
-- [ ] Detection is real: the monitoring agent calls `find_incidents_direct()`; each run's
+- [x] `make incident` creates a tagged test metric (`put_metric_data`) and alarm, and drives it
+      into `ALARM`. Verified 2026-10-22: `scripts/incident.py` created
+      `a2a-incident-demo-checkout-api-test-errors` (namespace `A2AIncidentDemo`, metric
+      `SyntheticErrorRate`, 10s high-resolution period) and drove it to `ALARM` for real in
+      ~25s. Real gotcha hit and fixed in-session: the Makefile's region pin used `?=`, which is
+      a no-op when the calling shell already exports `AWS_REGION` (mine did, to
+      `ap-southeast-2`) -- the alarm was first created in the wrong region entirely. Fixed to
+      an unconditional `:=` and re-ran correctly in `us-east-1`.
+- [x] Detection is real: the monitoring agent calls `find_incidents_direct()`; each run's
       finding must contain the real alarm name and a metric value matching
       `describe-alarms`/`get-metric-statistics`. Misses count as failed runs and are reported,
-      never retried away. Detection success rate is published.
-- [ ] Agent-to-agent hand-off: in pattern (c) the monitoring agent itself (running on
+      never retried away. Detection success rate is published. Verified: 5/5 pattern-(c)-real
+      runs detected the real alarm and metric value for real (100%); see
+      `docs/transcript.txt`.
+- [x] Agent-to-agent hand-off: in pattern (c) the monitoring agent itself (running on
       AgentCore Runtime) fetches the remediation agent's card and sends `message/send` with its
       own OAuth token. `demo.py` only triggers the run. Patterns (a) and (b) stay as transport
       baselines (unchanged, still client-driven, since they exist to measure transport cost,
-      not the hand-off).
-- [ ] `TEST_FINDING` is kept only as a labelled control run for like-for-like comparison with
-      the 2026-10-21 numbers.
-- [ ] Timestamps per step, with sources: alarm `StateUpdatedTimestamp` (AWS, not the laptop
+      not the hand-off). Verified live 2026-10-22, both container logs correlated in
+      `docs/transcript.txt`'s hero timeline: `monitoring_agent/agent.py`'s
+      `handoff_to_remediation_agent` tool fetches its own token, does `GET
+      /.well-known/agent-card.json` and `POST /` (`message/send`) against the remediation
+      runtime, and `demo.py`'s pattern-(c)-real path never calls the remediation runtime at
+      all -- confirmed by reading the actual code path, not just the transcript.
+- [x] `TEST_FINDING` is kept only as a labelled control run for like-for-like comparison with
+      the 2026-10-21 numbers. `pattern_c_control_test_finding()` in `demo/demo.py`, explicitly
+      labelled "CONTROL" in the transcript; median 18.831s vs the 2026-10-21 run's 19.116s --
+      consistent, as expected for an unchanged transport path.
+- [x] Timestamps per step, with sources: alarm `StateUpdatedTimestamp` (AWS, not the laptop
       clock), detection, card fetch, token, `message/send`, `classify`, `recommend` (UTC,
       container clock; skew recorded). Each run splits detection time vs hand-off time.
-- [ ] Input/output tokens per model call logged for real; pinned model IDs recorded in the
-      transcript (Claude 3.5 Haiku's EOL was already one gotcha from skipping this).
-- [ ] 5 runs per pattern; all runs published in the transcript. Hero timeline uses the
-      pre-declared MEDIAN pattern-(c) run, not the best one.
-- [ ] Spend cap: stop and report if spend exceeds ~$5, rather than running unbounded.
-- [ ] `make destroy` also removes the metric and alarm; teardown independently verified
+      Verified: `docs/incident.json` carries the real `StateUpdatedTimestamp` from
+      `describe-alarms`; every container-side STEP log line carries its own
+      `datetime.now(timezone.utc)`, pulled from CloudWatch Logs and shown in the hero
+      timeline; the gap between the laptop's send time and the container's first STEP
+      (+1.357s on the published hero run) is reported as-is, labelled as unseparated
+      latency+skew, not claimed as pure clock skew.
+- [x] Input/output tokens per model call logged for real; pinned model IDs recorded in the
+      transcript (Claude 3.5 Haiku's EOL was already one gotcha from skipping this). Verified:
+      both agents log a `model_usage` STEP line with real `inputTokens`/`outputTokens` (Strands
+      `event_loop_metrics.accumulated_usage` via an `AfterInvocationEvent` hook; LangChain's
+      `response.usage_metadata`) and the pinned model id
+      `us.anthropic.claude-haiku-4-5-20251001-v1:0`, visible in `docs/transcript.txt`'s hero
+      timeline.
+- [x] 5 runs per pattern; all runs published in the transcript. Hero timeline uses the
+      pre-declared MEDIAN pattern-(c) run, not the best one. Verified: all 20 runs (5 each,
+      patterns a/b/c-control/c-real) are in `docs/transcript.txt`; the hero timeline is
+      `real-1` at 25.270s, the sorted-median of [23.741, 25.270, 23.929, 26.418, 25.398] --
+      selected by `sorted(...)[len//2]` in code before any run's content was read, not picked
+      after the fact.
+- [x] Spend cap: stop and report if spend exceeds ~$5, rather than running unbounded. Verified:
+      `demo.py` checks real CloudWatch `AWS/Bedrock` usage against the $5 cap before and after
+      each run; final session total was ~$0.245 (below the first build's bar, but this build
+      also made many more model-invoking calls while debugging IAM -- see session note).
+- [x] `make destroy` also removes the metric and alarm; teardown independently verified
       (`describe-alarms` / metric list empty), same discipline as the existing "Teardown"
-      section.
-- [ ] **Approval condition 2 (2026-10-22):** the monitoring agent obtains the OAuth credential
+      section. Verified 2026-10-22: `scripts/teardown_incident.py` deleted the alarm and
+      `describe-alarms` confirmed it gone; `list-metrics` still shows the metric's metadata
+      (CloudWatch has no delete-metric API at all -- confirmed, not assumed -- so this is
+      expected AWS behaviour, documented rather than hidden, same honesty standard as the
+      existing ECR-leftover note in README). Stack, both AgentCore runtimes, the Cognito pool,
+      and the OAuth2 credential provider were all independently confirmed gone after
+      `cdk destroy`.
+- [x] **Approval condition 2 (2026-10-22):** the monitoring agent obtains the OAuth credential
       it now needs (to call the remediation agent itself, per the agent-to-agent criterion
       above) through AgentCore Identity's outbound auth / credential provider mechanism, with
-      no client secret in code, environment variables, or the container image. Checked ahead
-      of build: AWS's own docs confirm AgentCore's separate "workload access token" is scoped
-      to Amazon first-party AgentCore services only and won't help here on its own, and the
-      current stack's inter-agent auth is a Cognito client-credentials grant behind each
-      Runtime's `CustomJwtAuthorizer`, not AgentCore's native workload-identity trust --
-      `gateway-outbound-auth.html`'s outbound credential-provider pattern (store the Cognito
-      client secret in an AgentCore Identity credential provider, fetched by the running agent
-      at call time, never read from `os.environ` the way `demo.py`'s `MONITORING_CLIENT_SECRET`
-      currently is) looks like the right fit but is UNVERIFIED against a live build. If it
-      turns out not to fit this specific Cognito-JWT setup, stop and report exactly why before
-      falling back to Secrets Manager (least-bad fallback, still no secret in code/env/image)
-      or any other method -- do not silently default to an environment variable.
+      no client secret in code, environment variables, or the container image. **Outbound auth
+      fit and worked, verified live** -- see the Build-session note below for the real,
+      previously-UNVERIFIED mechanics this required (a `CognitoOauth2`-vendor
+      `CfnOAuth2CredentialProvider`, `UserPoolClient.userPoolClientSecret` resolved by CDK's
+      own custom resource rather than any literal, and the `@requires_access_token(...,
+      auth_flow="M2M")` SDK decorator) and the real IAM surface it turned out to need (five
+      iterations, not one guess) before the live call succeeded with zero secrets in
+      `monitoring_agent`'s env or image. No fallback to Secrets Manager was needed.
 
 ## Tier 2 (proposed only -- do NOT build without separate approval)
 One safe, reversible action behind human approval: the remediation agent PROPOSES an action
@@ -153,3 +189,47 @@ the live stack. All five acceptance criteria now pass; see the checked boxes abo
 exactly what was verified and any caveat. AWS resources were destroyed afterwards and
 teardown was independently verified (not just the CLI exit code) -- see README
 "Teardown".
+
+## Tier 1 fix session note (2026-10-22)
+Fixed the fake-incident problem this spec was reopened for. Full account in README.md
+"Status"/"Sharp edges"/"Cost"; summary here:
+
+- **Real incident, real detection, real agent-to-agent hand-off, all verified live.**
+  `make incident` drives a real tagged CloudWatch alarm into `ALARM`; the monitoring
+  agent's own `find_incidents_direct()` tool loop found it for real in all 5 pattern-(c)
+  runs (100% detection rate, checked against `describe-alarms`/`get-metric-statistics`
+  each time); the monitoring agent itself -- not `demo.py` -- fetched the remediation
+  agent's card and sent `message/send` with its own OAuth token.
+- **Approval condition 2 (outbound auth) worked, but needed five IAM iterations, not
+  one.** `GetResourceOauth2Token`'s AccessDeniedException named a DIFFERENT exact
+  resource ARN as the blocker on each of five live deploy-and-retry cycles, in this
+  order: the credential provider ARN, the runtime's workload-identity ARN, the
+  workload-identity-directory ARN, the token-vault ARN, and finally a Secrets-Manager
+  `secretsmanager:GetSecretValue` on the actual AWS-Secrets-Manager-backed secret
+  AgentCore Identity stores the Cognito client secret in
+  (`bedrock-agentcore-identity!default/oauth2/<provider-name>-<suffix>`) -- a real,
+  previously-undocumented-in-this-repo finding: the credential provider's secret isn't
+  purely internal to AgentCore Identity, the CALLING ROLE needs direct Secrets Manager
+  read access to it too. None of this was guessed; each fix was driven by reading the
+  literal `AccessDeniedException` text out of CloudWatch Logs after adding a
+  `token_fetch_FAILED` debug log line, not by re-reading AWS docs blind.
+- **Two more real bugs, unrelated to outbound auth, found the same way:**
+  (1) `monitoring_agent`'s container never actually had `a2a-sdk` installed -- a LATENT
+  bug from the 2026-10-21 build, invisible until this session's new pattern-(c)-real path
+  became the first thing to ever send a real A2A `message/send` to the monitoring
+  runtime (the old build only ever drove the remediation runtime). (2) Strands'
+  `A2AServer` builds its `A2AStarletteApplication` without wiring in
+  `bedrock_agentcore.runtime.a2a`'s `BedrockCallContextBuilder`, so the Runtime's
+  per-request `WorkloadAccessToken` header was never extracted into
+  `BedrockAgentCoreContext` -- fixed with a small FastAPI middleware that does that
+  extraction itself.
+- **A Makefile region-pinning bug, caught immediately by its own safety net:** the
+  region pin used `export AWS_REGION ?= us-east-1`, which is a no-op when the calling
+  shell already exports `AWS_REGION` (mine did, to `ap-southeast-2`) -- `make incident`
+  silently created the first test alarm in the wrong region. Caught because
+  `scripts/incident.py` prints the region it's using; fixed to an unconditional `:=`.
+- **No fallback to Secrets Manager was needed** -- the outbound-auth pattern worked once
+  the full real IAM surface was granted. Spend for this entire session (deploy, five
+  redeploys while fixing IAM, ~30 real model-invoking calls across two full `make demo`
+  runs, destroy): ~$0.245, independently pulled from this session's real `AWS/Bedrock`
+  CloudWatch usage metrics, well under the $5 cap.

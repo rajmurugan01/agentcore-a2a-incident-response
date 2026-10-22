@@ -14,11 +14,13 @@ AgentExecutor/A2AStarletteApplication primitives directly.
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import TypedDict
 
 import uvicorn
 from langchain_aws import ChatBedrock
 from langgraph.graph import StateGraph, END
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -36,6 +38,18 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 # AgentCore Runtime's A2A ProtocolConfiguration proxies the container on port 9000 at the
 # root path, not 8080 -- see monitoring_agent/agent.py for the full note.
 PORT = int(os.environ.get("PORT", 9000))
+
+
+def _utcnow() -> str:
+    """UTC timestamp logged from INSIDE this container -- Tier 1 criterion 5's
+    'classify'/'recommend' steps need their own container-clock provenance, separate
+    from the monitoring agent's clock and the laptop's."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _log_step(step: str, **fields) -> None:
+    payload = {"ts": _utcnow(), "step": step, **fields}
+    logger.info("STEP %s", json.dumps(payload, default=str))
 
 with open(os.path.join(os.path.dirname(__file__), "runbooks.json")) as f:
     RUNBOOKS = json.load(f)
@@ -57,17 +71,21 @@ class RemediationState(TypedDict):
 
 def classify_finding(state: RemediationState) -> RemediationState:
     """Match the finding's keywords against the local runbook knowledge source."""
+    _log_step("classify_start", finding=state["finding"])
     text = state["finding"].lower()
     for key, rb in RUNBOOKS.items():
         if key == "default":
             continue
         if any(term in text for term in rb["match"]):
+            _log_step("classify_done", runbook_key=key)
             return {**state, "runbook_key": key}
+    _log_step("classify_done", runbook_key="default")
     return {**state, "runbook_key": "default"}
 
 
 def recommend(state: RemediationState) -> RemediationState:
     """Ask the model to turn the matched runbook's steps into a recommendation for this finding."""
+    _log_step("recommend_start", runbook_key=state["runbook_key"])
     runbook = RUNBOOKS[state["runbook_key"]]
     prompt = (
         f"A monitoring agent reported this finding:\n{state['finding']}\n\n"
@@ -77,6 +95,18 @@ def recommend(state: RemediationState) -> RemediationState:
         "grounded in the matched runbook steps. Do not invent steps the runbook doesn't contain."
     )
     response = model.invoke(prompt)
+    _log_step("recommend_done")
+    try:
+        usage = response.usage_metadata or {}
+        _log_step(
+            "model_usage",
+            model_id=os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            total_tokens=usage.get("total_tokens"),
+        )
+    except Exception as exc:  # pragma: no cover -- never let usage logging break the response
+        logger.warning("Could not log token usage: %s", exc)
     return {**state, "recommendation": response.content}
 
 
@@ -132,6 +162,20 @@ request_handler = DefaultRequestHandler(
 )
 a2a_app = A2AStarletteApplication(agent_card=agent_card, http_handler=request_handler)
 app = a2a_app.build()
+
+
+async def _log_requests(request, call_next):
+    """Container-clock markers for every inbound call -- the hand-off's receiving end of
+    the clock-skew check (monitoring_agent/agent.py has the sending-container equivalent).
+    Plain Starlette (not FastAPI), so middleware is registered via add_middleware(), not
+    the @app.middleware("http") decorator sugar FastAPI adds."""
+    _log_step("runtime_request_start", path=request.url.path, method=request.method)
+    response = await call_next(request)
+    _log_step("runtime_request_done", path=request.url.path, status_code=response.status_code)
+    return response
+
+
+app.add_middleware(BaseHTTPMiddleware, dispatch=_log_requests)
 
 if __name__ == "__main__":
     logger.info("Starting remediation_agent A2A server on %s:%s", HOST, PORT)
