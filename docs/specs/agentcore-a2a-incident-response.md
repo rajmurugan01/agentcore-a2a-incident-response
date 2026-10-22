@@ -6,6 +6,11 @@ Repo: agentcore-a2a-incident-response
 ## Problem / why now
 Grounding material for the next rajmurugan.com post on what A2A actually changes for multi-agent systems -- needs real measured findings, not researched theory, per the site's Factual/Authenticity DoD gates.
 
+**The claim the post will make, which these criteria exist to test (added 2026-10-22):** two
+agents, built in different frameworks, detect a real CloudWatch incident and hand it off to
+each other over A2A on AgentCore -- not a script calling two agents in turn. Measured:
+detection success rate, hand-off latency, cost.
+
 ## Evidence-review finding (2026-10-22) -- why this spec is reopened
 The shipped build (criteria below, all originally checked off 2026-10-21) measures A2A
 transport mechanics for real, but does NOT demonstrate an incident being detected or any
@@ -28,23 +33,54 @@ directly against `demo.py` and `docs/transcript.txt`:
 Decision (Raj, 2026-10-22): fix the demo so the incident story is real before any post
 rewrite. Scope below, two tiers.
 
-## Tier 1 acceptance criteria (required, build this first)
-- [ ] `make incident` creates a real, tagged test CloudWatch metric (via `put_metric_data`)
-      and an alarm on it, and pushes the metric above the alarm's threshold so it actually
-      enters `ALARM` state.
-- [ ] All three comms patterns (direct call / native invoke / full A2A) start from
-      `find_incidents_direct()`'s REAL output (the monitoring agent actually calling
-      `list_alarms_in_alarm_state()` and finding the real test alarm), not `TEST_FINDING`.
-      `TEST_FINDING` is kept only as an explicitly labelled control run, so the latency/cost
-      comparison in the post stays like-for-like against the original numbers.
-- [ ] The transcript logs real wall-clock timestamps for each step of the real-incident run:
-      alarm enters ALARM, monitoring agent detects it, agent-card fetch, OAuth token fetch,
-      `message/send`, `classify_finding`, `recommend`. This is the data the hero diagram
-      storyboard gets built from -- no step, no diagram claim.
-- [ ] 5 runs per pattern, same as the current build.
-- [ ] `make destroy` removes the test metric and alarm too (not just the AgentCore/Cognito
-      stack), and teardown is independently verified (describe-alarms / list metrics show
-      nothing left), same discipline as the existing "Teardown" section.
+## Tier 1 acceptance criteria (required)
+
+**Review round 2 (2026-10-22): the round-1 draft above would still have shipped a demo that
+doesn't tell the story.** Four must-fix problems, with the reasoning kept here since the next
+build session needs the why, not just the checklist:
+
+1. **The hand-off still wasn't agent to agent.** In every pattern, `demo.py` is the client: it
+   calls the monitoring agent, then calls the remediation agent itself. Real detection alone
+   doesn't fix this -- the post still couldn't honestly say "a Strands agent handed the
+   incident to a LangGraph agent over A2A", because the hand-off is actually scripted from
+   outside both agents. Fixed by requiring the monitoring agent itself to make the
+   `message/send` call in pattern (c), using its own token. `demo.py` only triggers the run.
+2. **Detection had no pass/fail test.** An LLM-driven agent can miss or hallucinate a finding.
+   Fixed by requiring each run's finding to be checked against ground truth
+   (`describe-alarms`/`get-metric-statistics`), with misses counted and reported, never
+   silently retried.
+3. **"The best run" was cherry-picking.** Pre-declare the median pattern-(c) run as the hero
+   timeline before looking at results, and publish every run, not just the best one.
+4. **Timestamp provenance was unspecified.** "Alarm enters ALARM" has to come from AWS's own
+   `StateUpdatedTimestamp`, not the laptop clock running the script; in-runtime steps log UTC
+   from the container; any clock skew between the two gets recorded, not silently absorbed.
+
+Replacement criteria (supersede the round-1 list above):
+
+- [ ] `make incident` creates a tagged test metric (`put_metric_data`) and alarm, and drives it
+      into `ALARM`.
+- [ ] Detection is real: the monitoring agent calls `find_incidents_direct()`; each run's
+      finding must contain the real alarm name and a metric value matching
+      `describe-alarms`/`get-metric-statistics`. Misses count as failed runs and are reported,
+      never retried away. Detection success rate is published.
+- [ ] Agent-to-agent hand-off: in pattern (c) the monitoring agent itself (running on
+      AgentCore Runtime) fetches the remediation agent's card and sends `message/send` with its
+      own OAuth token. `demo.py` only triggers the run. Patterns (a) and (b) stay as transport
+      baselines (unchanged, still client-driven, since they exist to measure transport cost,
+      not the hand-off).
+- [ ] `TEST_FINDING` is kept only as a labelled control run for like-for-like comparison with
+      the 2026-10-21 numbers.
+- [ ] Timestamps per step, with sources: alarm `StateUpdatedTimestamp` (AWS, not the laptop
+      clock), detection, card fetch, token, `message/send`, `classify`, `recommend` (UTC,
+      container clock; skew recorded). Each run splits detection time vs hand-off time.
+- [ ] Input/output tokens per model call logged for real; pinned model IDs recorded in the
+      transcript (Claude 3.5 Haiku's EOL was already one gotcha from skipping this).
+- [ ] 5 runs per pattern; all runs published in the transcript. Hero timeline uses the
+      pre-declared MEDIAN pattern-(c) run, not the best one.
+- [ ] Spend cap: stop and report if spend exceeds ~$5, rather than running unbounded.
+- [ ] `make destroy` also removes the metric and alarm; teardown independently verified
+      (`describe-alarms` / metric list empty), same discipline as the existing "Teardown"
+      section.
 
 ## Tier 2 (proposed only -- do NOT build without separate approval)
 One safe, reversible action behind human approval: the remediation agent PROPOSES an action
@@ -65,6 +101,17 @@ deliberately short of full autonomy.
   `agentcore-acts-as-the-user` repo already built Gateway + Cedar once and documented its
   real sharp edges (a role-vs-resource creation-order dependency, a Cedar `like` match
   collision) -- those are known traps to check for up front this time, not blind territory.
+
+**Specifics for when this is approved (added 2026-10-22, review round 2), so "approved" is
+unambiguous when it happens:**
+- Approval is a logged y/n with a timestamp and an identified approver, not an implicit step.
+- One test shows the agent attempting the action WITHOUT approval being denied by code or
+  policy -- not merely discouraged in a prompt. The prompt-only "do not take an automated
+  remediation action" line already in `runbooks.json`'s `default` entry does not satisfy this;
+  it is advisory text, not an enforced gate.
+- One test shows a call against an untagged resource being denied by the Cedar policy.
+- The rollback (resetting the SSM flag / alarm back to its prior state) is itself verified,
+  not just invoked.
 
 ## Non-goals
 - Not the AWS sample 1:1 (no Google ADK host, no JIRA, no Tavily).
