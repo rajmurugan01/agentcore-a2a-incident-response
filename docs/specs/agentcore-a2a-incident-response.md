@@ -4,12 +4,13 @@ Date: 2026-10-19, revised 2026-10-22   Domain: Professional (public companion re
 Repo: agentcore-a2a-incident-response
 
 ## Problem / why now
-Grounding material for the next rajmurugan.com post on what A2A actually changes for multi-agent systems -- needs real measured findings, not researched theory, per the site's Factual/Authenticity DoD gates.
+**The claim this spec exists to test (rewritten 2026-10-22, approval condition 1):** two
+agents built in different frameworks detect a real CloudWatch incident and hand it off
+agent-to-agent over A2A on AgentCore -- not a script calling two agents in turn. Measured:
+detection rate, hand-off latency, cost.
 
-**The claim the post will make, which these criteria exist to test (added 2026-10-22):** two
-agents, built in different frameworks, detect a real CloudWatch incident and hand it off to
-each other over A2A on AgentCore -- not a script calling two agents in turn. Measured:
-detection success rate, hand-off latency, cost.
+This is the grounding material for the next rajmurugan.com post; needs real measured
+findings, not researched theory, per the site's Factual/Authenticity DoD gates.
 
 ## Evidence-review finding (2026-10-22) -- why this spec is reopened
 The shipped build (criteria below, all originally checked off 2026-10-21) measures A2A
@@ -81,6 +82,21 @@ Replacement criteria (supersede the round-1 list above):
 - [ ] `make destroy` also removes the metric and alarm; teardown independently verified
       (`describe-alarms` / metric list empty), same discipline as the existing "Teardown"
       section.
+- [ ] **Approval condition 2 (2026-10-22):** the monitoring agent obtains the OAuth credential
+      it now needs (to call the remediation agent itself, per the agent-to-agent criterion
+      above) through AgentCore Identity's outbound auth / credential provider mechanism, with
+      no client secret in code, environment variables, or the container image. Checked ahead
+      of build: AWS's own docs confirm AgentCore's separate "workload access token" is scoped
+      to Amazon first-party AgentCore services only and won't help here on its own, and the
+      current stack's inter-agent auth is a Cognito client-credentials grant behind each
+      Runtime's `CustomJwtAuthorizer`, not AgentCore's native workload-identity trust --
+      `gateway-outbound-auth.html`'s outbound credential-provider pattern (store the Cognito
+      client secret in an AgentCore Identity credential provider, fetched by the running agent
+      at call time, never read from `os.environ` the way `demo.py`'s `MONITORING_CLIENT_SECRET`
+      currently is) looks like the right fit but is UNVERIFIED against a live build. If it
+      turns out not to fit this specific Cognito-JWT setup, stop and report exactly why before
+      falling back to Secrets Manager (least-bad fallback, still no secret in code/env/image)
+      or any other method -- do not silently default to an environment variable.
 
 ## Tier 2 (proposed only -- do NOT build without separate approval)
 One safe, reversible action behind human approval: the remediation agent PROPOSES an action
