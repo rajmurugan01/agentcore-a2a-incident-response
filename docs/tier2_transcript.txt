@@ -26,7 +26,7 @@ APPROVAL REQUIRED
 Proposed by remediation agent: Enable the checkout-api-test maintenance-mode flag to shed load onto a degraded-but-safe path while the error rate is investigated. Safe and reversible: set back to "false" once resolved (Tier 2's rollback step does exactly this and verifies it).
   parameter: /a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode -> 'true'
   (non-interactive session -- no human TTY present; decision supplied via env_var_non_interactive(TIER2_APPROVAL): 'y'. Run interactively to approve at a real prompt instead.)
-  LOGGED: approver=arn:aws:sts::129875820670:assumed-role/AWSReservedSSO_AdministratorAccess_5117d3a3f5d993cc/raj decision='y' approved=True at 2026-10-22T08:48:32.466648+00:00 -> /Users/rajmurugan/Documents/personal/agentcore-a2a-incident-response/docs/tier2_approval_log.jsonl
+  LOGGED: approver=arn:aws:sts::<redacted-account-id>:assumed-role/AWSReservedSSO_AdministratorAccess_<redacted-role-id>/raj decision='y' approved=True at 2026-10-22T08:48:32.466648+00:00 -> /Users/rajmurugan/Documents/personal/agentcore-a2a-incident-response/docs/tier2_approval_log.jsonl
 
 == TEST 3: approved call against the correct, tagged resource ==
   [PASS] ALLOWED -- [{"type": "text", "text": "{\"parameter_name\":\"/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode\",\"previous_value\":\"false\",\"requested_value\":\"true\",\"confirmed_value\":\"true\",\"executed_at_
@@ -40,7 +40,7 @@ APPROVAL REQUIRED
 ROLLBACK of the above action: reset /a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode back to 'false'.
   parameter: /a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode -> 'false'
   (non-interactive session -- no human TTY present; decision supplied via env_var_non_interactive(TIER2_APPROVAL): 'y'. Run interactively to approve at a real prompt instead.)
-  LOGGED: approver=arn:aws:sts::129875820670:assumed-role/AWSReservedSSO_AdministratorAccess_5117d3a3f5d993cc/raj decision='y' approved=True at 2026-10-22T08:48:35.610793+00:00 -> /Users/rajmurugan/Documents/personal/agentcore-a2a-incident-response/docs/tier2_approval_log.jsonl
+  LOGGED: approver=arn:aws:sts::<redacted-account-id>:assumed-role/AWSReservedSSO_AdministratorAccess_<redacted-role-id>/raj decision='y' approved=True at 2026-10-22T08:48:35.610793+00:00 -> /Users/rajmurugan/Documents/personal/agentcore-a2a-incident-response/docs/tier2_approval_log.jsonl
   [PASS] ALLOWED -- [{"type": "text", "text": "{\"parameter_name\":\"/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode\",\"previous_value\":\"true\",\"requested_value\":\"false\",\"confirmed_value\":\"false\",\"executed_at
   INDEPENDENTLY VERIFIED via a direct ssm:GetParameter call: now 'false', matches the pre-action value 'false': True
 

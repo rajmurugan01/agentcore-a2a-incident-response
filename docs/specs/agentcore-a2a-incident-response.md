@@ -163,7 +163,7 @@ the Tier 2 Gateway's JWT authorizer at all.
 - [x] Approval is a logged y/n with a timestamp and an identified approver, not an implicit
       step. Verified: `docs/tier2_approval_log.jsonl` has one line per approval decision,
       e.g. `{"ts": "2026-10-22T08:48:32.466648+00:00", "approver_arn":
-      "arn:aws:sts::129875820670:assumed-role/AWSReservedSSO_AdministratorAccess_.../raj",
+      "arn:aws:sts::<redacted-account-id>:assumed-role/AWSReservedSSO_AdministratorAccess_.../raj",
       "decision": "y", "approved": true, "source":
       "env_var_non_interactive(TIER2_APPROVAL)", ...}`. The approver identity is never
       hardcoded -- it's read live from `aws sts get-caller-identity` at approval time.
