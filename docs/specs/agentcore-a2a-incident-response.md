@@ -1,6 +1,6 @@
 # Spec: AgentCore A2A cross-framework incident-response demo
 Status: Tier 1 shipped and verified live 2026-10-22 (see "Tier 1 fix session note" below).
-Tier 2 remains proposed only -- not approved, not built.
+Tier 2 approved by Raj 2026-10-22 ("go tier 2") -- building, per the criteria below.
 Date: 2026-10-19, revised 2026-10-22   Domain: Professional (public companion repo for rajmurugan.com)
 Repo: agentcore-a2a-incident-response
 
@@ -138,7 +138,7 @@ Replacement criteria (supersede the round-1 list above):
       AWS's own devguide documents for this, re-verified live -- see the "Tier 1 fix
       session note" below for the full account.
 
-## Tier 2 (proposed only -- do NOT build without separate approval)
+## Tier 2 (approved by Raj 2026-10-22, "go tier 2" -- building)
 One safe, reversible action behind human approval: the remediation agent PROPOSES an action
 (e.g. setting an SSM Parameter Store feature-flag value, or resetting the test alarm), a
 human approves it, and only then does it execute -- through an AgentCore Gateway with a
