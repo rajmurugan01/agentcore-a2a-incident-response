@@ -225,30 +225,56 @@ export class A2AIncidentResponseStack extends cdk.Stack {
     // resource it hits in a multi-resource action, not every one the action touches):
     // the credential provider ARN, the workload identity ARN, the workload identity
     // DIRECTORY ARN, and finally the TOKEN VAULT ARN one level up from the credential
-    // provider. GetResourceOauth2Token clearly touches a whole resource hierarchy
-    // (token-vault -> oauth2credentialprovider, workload-identity-directory ->
-    // workload-identity), not one resource -- rather than keep enumerating exact ARNs one
-    // deny at a time, this grants the two parent namespaces with a wildcard, which covers
-    // every resource under both in one statement.
+    // provider. A first pass closed this with two namespace wildcards
+    // (token-vault/*, workload-identity-directory/*), which worked but is an
+    // account-wide-within-service anti-pattern this repo's own point is to avoid --
+    // flagged in review (2026-10-22) against AWS's own least-privilege guidance
+    // (devguide "Scope down access to credential providers by workload identity"),
+    // which gives the exact four-ARN shape used below. Scoped to this stack's own
+    // resources only, not reconstructed by guessing the segment names: the workload
+    // identity's exact name (AgentCore's auto-created default identity, confirmed
+    // against the live AccessDeniedException text, not assumed from the devguide's
+    // generic example) and the credential provider's exact ARN both come from this
+    // stack's own resource attributes, not a hand-typed string -- the devguide's own
+    // example literal ("oauth2-credential-provider", hyphenated) does NOT match this
+    // resource's actual deployed `CredentialProviderArn` attribute ("oauth2credential
+    // provider", no hyphen, confirmed from this session's real CfnOutput every time it
+    // was printed) -- using the real attribute sidesteps that mismatch entirely rather
+    // than risk a silently-wrong Resource that happens to still "match" because an
+    // earlier wildcard was masking it.
+    const monitoringWorkloadIdentityDirectoryArn = `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/default`;
+    const monitoringWorkloadIdentityArn = `${monitoringWorkloadIdentityDirectoryArn}/workload-identity/${cdk.Fn.select(1, cdk.Fn.split('runtime/', monitoringRuntime.attrAgentRuntimeArn))}`;
+    const tokenVaultArn = `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/default`;
     new iam.Policy(this, 'MonitoringOutboundAuthPolicy', {
       roles: [monitoringRole],
       statements: [
         new iam.PolicyStatement({
           actions: ['bedrock-agentcore:GetResourceOauth2Token'],
           resources: [
-            `arn:aws:bedrock-agentcore:${this.region}:${this.account}:token-vault/*`,
-            `arn:aws:bedrock-agentcore:${this.region}:${this.account}:workload-identity-directory/*`,
+            monitoringWorkloadIdentityDirectoryArn,
+            monitoringWorkloadIdentityArn,
+            tokenVaultArn,
+            monitoringToRemediationCredentialProvider.attrCredentialProviderArn,
           ],
         }),
         // A FIFTH deny, past all four bedrock-agentcore ones above: AgentCore Identity
         // stores the credential provider's client secret as an actual AWS Secrets
-        // Manager secret (name convention confirmed live:
-        // "bedrock-agentcore-identity!default/oauth2/<provider-name>-<random-suffix>"),
-        // and GetResourceOauth2Token reads it using the CALLING ROLE's own IAM identity,
-        // not an AgentCore-internal service role -- so the monitoring role ALSO needs
-        // secretsmanager:GetSecretValue on that secret directly. The random suffix is
-        // only known after the credential provider is created, so this is a prefix
-        // wildcard rather than an exact ARN.
+        // Manager secret, and GetResourceOauth2Token reads it using the CALLING ROLE's
+        // own IAM identity, not an AgentCore-internal service role -- so the monitoring
+        // role ALSO needs secretsmanager:GetSecretValue on that secret directly.
+        // Tried the credential provider's own attrClientSecretArn attribute first (it
+        // exists on CfnOAuth2CredentialProvider and looked like the exact-ARN answer),
+        // but it resolves to a structured value, not a bare ARN string -- passing it
+        // into Resource produced "Syntax errors in policy" at deploy time (caught live,
+        // not guessed). There is no AWS-documented exact-ARN form for this specific
+        // secret (unlike the four bedrock-agentcore ARNs above, which the devguide
+        // documents explicitly) -- a name-PREFIX wildcard, scoped to this credential
+        // provider's own name only (never a service- or account-wide `*`), is the
+        // narrowest thing that actually deploys. The real secret name was confirmed
+        // live via the AccessDeniedException text:
+        // "bedrock-agentcore-identity!default/oauth2/<provider-name>-<random-suffix>"
+        // -- the random suffix is only assigned at creation time, which is why the
+        // wildcard is needed at all here, not from not having looked.
         new iam.PolicyStatement({
           actions: ['secretsmanager:GetSecretValue'],
           resources: [

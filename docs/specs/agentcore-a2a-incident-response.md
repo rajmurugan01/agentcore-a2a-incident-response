@@ -132,7 +132,11 @@ Replacement criteria (supersede the round-1 list above):
       own custom resource rather than any literal, and the `@requires_access_token(...,
       auth_flow="M2M")` SDK decorator) and the real IAM surface it turned out to need (five
       iterations, not one guess) before the live call succeeded with zero secrets in
-      `monitoring_agent`'s env or image. No fallback to Secrets Manager was needed.
+      `monitoring_agent`'s env or image. No fallback to Secrets Manager was needed. The
+      first working IAM fix used two namespace wildcards; caught in review as an
+      anti-pattern this fix exists to avoid and replaced with the exact four-ARN policy
+      AWS's own devguide documents for this, re-verified live -- see the "Tier 1 fix
+      session note" below for the full account.
 
 ## Tier 2 (proposed only -- do NOT build without separate approval)
 One safe, reversible action behind human approval: the remediation agent PROPOSES an action
@@ -201,18 +205,34 @@ Fixed the fake-incident problem this spec was reopened for. Full account in READ
   each time); the monitoring agent itself -- not `demo.py` -- fetched the remediation
   agent's card and sent `message/send` with its own OAuth token.
 - **Approval condition 2 (outbound auth) worked, but needed five IAM iterations, not
-  one.** `GetResourceOauth2Token`'s AccessDeniedException named a DIFFERENT exact
-  resource ARN as the blocker on each of five live deploy-and-retry cycles, in this
-  order: the credential provider ARN, the runtime's workload-identity ARN, the
-  workload-identity-directory ARN, the token-vault ARN, and finally a Secrets-Manager
-  `secretsmanager:GetSecretValue` on the actual AWS-Secrets-Manager-backed secret
-  AgentCore Identity stores the Cognito client secret in
-  (`bedrock-agentcore-identity!default/oauth2/<provider-name>-<suffix>`) -- a real,
+  one -- and the first fix that deployed was itself a wildcard anti-pattern, caught and
+  tightened in review.** `GetResourceOauth2Token`'s AccessDeniedException named a
+  DIFFERENT exact resource ARN as the blocker on each of five live deploy-and-retry
+  cycles, in this order: the credential provider ARN, the runtime's workload-identity
+  ARN, the workload-identity-directory ARN, the token-vault ARN, and finally a
+  Secrets-Manager `secretsmanager:GetSecretValue` on the actual
+  AWS-Secrets-Manager-backed secret AgentCore Identity stores the Cognito client secret
+  in (`bedrock-agentcore-identity!default/oauth2/<provider-name>-<suffix>`) -- a real,
   previously-undocumented-in-this-repo finding: the credential provider's secret isn't
   purely internal to AgentCore Identity, the CALLING ROLE needs direct Secrets Manager
   read access to it too. None of this was guessed; each fix was driven by reading the
   literal `AccessDeniedException` text out of CloudWatch Logs after adding a
-  `token_fetch_FAILED` debug log line, not by re-reading AWS docs blind.
+  `token_fetch_FAILED` debug log line, not by re-reading AWS docs blind. The build's
+  first working fix closed the four bedrock-agentcore denials with two namespace
+  wildcards (`token-vault/*`, `workload-identity-directory/*`) -- flagged in review as an
+  account-wide-within-service anti-pattern inconsistent with the whole point of this
+  fix, and replaced with the exact four-ARN policy AWS's own devguide documents for
+  this ("Scope down access to credential providers by workload identity"), using this
+  stack's own real resource attributes (the auto-created workload identity's exact name,
+  confirmed via the live AccessDeniedException text; the credential provider's exact
+  `attrCredentialProviderArn`) rather than hand-typed strings. Re-verified live: a fresh
+  deploy with the scoped policy, then two real pattern-(c) hand-off calls, both
+  succeeded with zero AccessDeniedExceptions. The Secrets Manager grant stays a
+  name-prefix wildcard (scoped to this one credential provider's name, not account- or
+  service-wide) -- AWS's devguide gives no exact-ARN form for this secret, and the
+  credential provider's own `attrClientSecretArn` attribute resolves to a structured
+  value, not a bare ARN string (passing it into a policy `Resource` produced `"Syntax
+  errors in policy"` at deploy time, caught live and reverted).
 - **Two more real bugs, unrelated to outbound auth, found the same way:**
   (1) `monitoring_agent`'s container never actually had `a2a-sdk` installed -- a LATENT
   bug from the 2026-10-21 build, invisible until this session's new pattern-(c)-real path

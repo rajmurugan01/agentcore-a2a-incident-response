@@ -203,22 +203,39 @@ never actually sent the monitoring runtime a real A2A message.
    the workload-identity-DIRECTORY ARN; granting that got denied naming the token-vault
    ARN. Five live deploy-and-retry cycles, each one driven by the literal exception text
    pulled from CloudWatch Logs (via a `token_fetch_FAILED` debug log line added
-   specifically to see it), not by re-guessing from docs. Fixed with two wildcard grants
-   (`token-vault/*`, `workload-identity-directory/*`) rather than keep enumerating exact
-   ARNs.
+   specifically to see it), not by re-guessing from docs. **First fix used two namespace
+   wildcards (`token-vault/*`, `workload-identity-directory/*`) to stop the
+   one-exact-ARN-at-a-time cycle** -- caught in review as an account-wide-within-service
+   anti-pattern this repo's own point is to avoid, and corrected against AWS's own
+   least-privilege guidance (devguide: "Scope down access to credential providers by
+   workload identity"), which documents the exact four-ARN shape:
+   `workload-identity-directory/default`, `.../workload-identity/<name>`,
+   `token-vault/default`, `.../oauth2-credential-provider/<name>`. The final policy in
+   `cdk/lib/stack.ts`'s `MonitoringOutboundAuthPolicy` uses exactly these four, with real
+   values (the runtime's own auto-created workload-identity name, confirmed against the
+   live `AccessDeniedException` text rather than assumed, and the credential provider's
+   own `attrCredentialProviderArn` CFN attribute) -- no wildcards. One live mismatch
+   worth flagging: the devguide's own example literal is `oauth2-credential-provider`
+   (hyphenated); this stack's actual deployed `CredentialProviderArn` attribute is
+   `oauth2credentialprovider` (no hyphen), confirmed every time it was printed by
+   `CfnOutput` across multiple deploys -- using the live CFN attribute instead of a
+   hand-typed string sidesteps that mismatch entirely. Re-verified live after tightening:
+   a fresh deploy + two real pattern-(c) hand-off calls succeeded with zero
+   `AccessDeniedException`s under the scoped policy.
 5. **AgentCore Identity stores the credential provider's client secret as an actual AWS
    Secrets Manager secret, and the CALLING ROLE needs `secretsmanager:GetSecretValue` on
-   it directly -- not an AgentCore-internal service role.** The fifth and final deny:
-   `Access denied when retrieving secret
+   it directly -- not an AgentCore-internal service role.** The fifth deny: `Access
+   denied when retrieving secret
    'arn:aws:secretsmanager:...:secret:bedrock-agentcore-identity!default/oauth2/
-   monitoring-to-remediation-cognito-<suffix>'`. This is a genuinely new finding, not
-   documented anywhere this build checked beforehand: `GetResourceOauth2Token` reads the
-   secret using the caller's own SigV4 identity, so the monitoring role needed an
-   explicit `secretsmanager:GetSecretValue` grant scoped to that secret's name prefix.
-   Once added, the live hand-off succeeded end to end with zero secrets in
-   `monitoring_agent`'s code, env, or image -- see `cdk/lib/stack.ts`'s
-   `MonitoringOutboundAuthPolicy` for the full, now-correct grant and the inline history
-   of what each wrong guess actually said.
+   monitoring-to-remediation-cognito-<suffix>'`. Genuinely new finding, not documented
+   anywhere this build checked beforehand. Unlike the four `bedrock-agentcore` ARNs
+   above, AWS's devguide gives no exact-ARN form for this AgentCore-Identity-managed
+   secret, and `CfnOAuth2CredentialProvider.attrClientSecretArn` -- which looked like the
+   exact-ARN answer -- resolves to a structured value, not a bare ARN string: passing it
+   into a policy `Resource` produced `"Syntax errors in policy"` at deploy time (caught
+   live, not guessed, and reverted). A name-PREFIX wildcard, scoped to this credential
+   provider's own name only (never account- or service-wide), is the narrowest thing that
+   actually deploys, since the random suffix is only assigned at creation time.
 
 ## How it works
 
