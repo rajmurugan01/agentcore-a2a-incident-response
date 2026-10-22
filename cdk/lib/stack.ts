@@ -3,6 +3,8 @@ import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as ecrAssets from 'aws-cdk-lib/aws-ecr-assets';
 import * as agentcore from 'aws-cdk-lib/aws-bedrockagentcore';
 
@@ -27,10 +29,16 @@ export class A2AIncidentResponseStack extends cdk.Stack {
       scopes: [
         { scopeName: 'monitoring.invoke', scopeDescription: 'Invoke the monitoring agent' },
         { scopeName: 'remediation.invoke', scopeDescription: 'Invoke the remediation agent' },
+        // Tier 2 (2026-10-22): a THIRD scope, for the human-approved execution step only.
+        // Deliberately not granted to either agent client below -- the remediation agent
+        // PROPOSES an action (agents/remediation_agent/agent.py's
+        // propose_remediation_action()) but has no credential able to execute one.
+        { scopeName: 'tier2.execute', scopeDescription: 'Execute an approved Tier 2 remediation action' },
       ],
     });
     const monitoringScope = cognito.OAuthScope.resourceServer(resourceServer, { scopeName: 'monitoring.invoke', scopeDescription: 'Invoke the monitoring agent' });
     const remediationScope = cognito.OAuthScope.resourceServer(resourceServer, { scopeName: 'remediation.invoke', scopeDescription: 'Invoke the remediation agent' });
+    const tier2ExecuteScope = cognito.OAuthScope.resourceServer(resourceServer, { scopeName: 'tier2.execute', scopeDescription: 'Execute an approved Tier 2 remediation action' });
 
     // Each agent gets its OWN client-credentials client, scoped only to invoke the
     // OTHER agent. A credential that could invoke itself is a code smell, not a feature.
@@ -41,6 +49,14 @@ export class A2AIncidentResponseStack extends cdk.Stack {
     const remediationClient = pool.addClient('RemediationClient', {
       generateSecret: true,
       oAuth: { flows: { clientCredentials: true }, scopes: [monitoringScope] },
+    });
+    // Tier 2's execution-step credential -- a THIRD, separate identity from both agents.
+    // Neither agent client above is scoped to tier2.execute, so neither agent could call
+    // the Tier 2 Gateway even if it tried; only whatever runs the human-approved
+    // execution step (scripts/tier2_demo.py) ever holds this credential.
+    const tier2ExecutorClient = pool.addClient('Tier2ExecutorClient', {
+      generateSecret: true,
+      oAuth: { flows: { clientCredentials: true }, scopes: [tier2ExecuteScope] },
     });
     const discoveryUrl = `https://cognito-idp.${this.region}.amazonaws.com/${pool.userPoolId}/.well-known/openid-configuration`;
 
@@ -313,6 +329,228 @@ export class A2AIncidentResponseStack extends cdk.Stack {
       })],
     });
 
+    // ── Tier 2 (approved by Raj 2026-10-22, "go tier 2"): one safe, reversible action
+    // behind human approval -- an AgentCore Gateway with a Cedar policy (ENFORCE mode)
+    // scoped to exactly one tagged test SSM parameter. "Two frameworks detect and
+    // propose; a human approves; policy enforces" -- the remediation agent (see
+    // propose_remediation_action() in agents/remediation_agent/agent.py) is never
+    // granted any credential able to reach this Gateway at all; only
+    // scripts/tier2_demo.py's separate Tier2ExecutorClient token can. See
+    // docs/specs/agentcore-a2a-incident-response.md's Tier 2 acceptance criteria for
+    // the four things this section exists to make true: a logged approval, a denied
+    // no-approval attempt, a denied untagged-resource attempt, and a verified rollback.
+
+    // The ONE resource Tier 2 is allowed to touch: a real, tagged test feature flag.
+    const maintenanceFlagParam = new ssm.StringParameter(this, 'MaintenanceFlagParam', {
+      parameterName: '/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode',
+      stringValue: 'false',
+      description: 'TEST feature flag for agentcore-a2a-incident-response Tier 2 -- reversible, '
+        + 'human-approved, Cedar-policy-enforced. Not a real production flag.',
+    });
+    maintenanceFlagParam.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+    cdk.Tags.of(maintenanceFlagParam).add('Project', 'agentcore-a2a-incident-response');
+    cdk.Tags.of(maintenanceFlagParam).add('Purpose', 'tier2-remediation-test');
+    cdk.Tags.of(maintenanceFlagParam).add('CreatedBy', 'cdk/lib/stack.ts');
+
+    // A second, deliberately UNTAGGED parameter -- a real SSM parameter outside Tier 2's
+    // approved scope, used ONLY to prove the denied-untagged-resource acceptance
+    // criterion. Cedar never queries live AWS resource tags (same limitation the
+    // agentcore-acts-as-the-user sibling repo's README documents for its own
+    // group-claim check: "Cedar only knows what the token says"/what's in context) --
+    // the Tier2ApprovalPolicy statement below permits exactly ONE parameter_name
+    // literal, and this parameter is deliberately not that one, so a call naming it is
+    // denied by Cedar's own default-deny, the same mechanism the sibling repo's
+    // "any other repo has no permit" case relies on.
+    const untaggedFlagParam = new ssm.StringParameter(this, 'UntaggedFlagParam', {
+      parameterName: '/a2a-incident-demo/feature-flags/untagged-example',
+      stringValue: 'false',
+      description: 'Deliberately UNTAGGED and outside Tier 2 approved scope -- exists only to '
+        + 'prove the Cedar policy denies a call against it.',
+    });
+    untaggedFlagParam.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
+
+    // Gateway target: a Lambda that does the actual ssm:GetParameter/PutParameter.
+    const setFeatureFlagFn = new lambda.Function(this, 'SetFeatureFlagFn', {
+      runtime: lambda.Runtime.PYTHON_3_13,
+      handler: 'set_feature_flag.handler',
+      code: lambda.Code.fromAsset(path.join(__dirname, '../../lambda')),
+      timeout: cdk.Duration.seconds(10),
+    });
+    // Least privilege: the Lambda may touch ONLY the one tagged test parameter -- never
+    // ssm:*/parameter/* -- even though this is a throwaway demo value. The whole point
+    // of this repo is the narrow form, not the wildcard that happens to also work.
+    maintenanceFlagParam.grantRead(setFeatureFlagFn);
+    maintenanceFlagParam.grantWrite(setFeatureFlagFn);
+
+    // Gateway execution role: same bedrock-agentcore service-principal trust condition
+    // Tier 1's runtime roles use (trustedByRuntime, defined above).
+    const tier2GatewayRole = new iam.Role(this, 'Tier2GatewayRole', { assumedBy: trustedByRuntime });
+    setFeatureFlagFn.grantInvoke(tier2GatewayRole);
+
+    const tier2Engine = new agentcore.CfnPolicyEngine(this, 'Tier2Engine', { name: 'tier2_remediation_engine' });
+
+    // Policy-in-AgentCore permissions on the Gateway execution role -- the three actions
+    // from AWS's own devguide
+    // (docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-permissions.html,
+    // fetched and read in this session, 2026-10-22), applying the Tier 1 outbound-auth
+    // lesson PROACTIVELY this time: scoped to THIS stack's own policy-engine/gateway IDs
+    // from the start, never policy-engine/* or gateway/* -- the devguide's own
+    // troubleshooting examples use those wildcards, but its explicit "production"
+    // guidance is to replace them with the specific resource IDs, which is what the
+    // ARNs below do (attrPolicyEngineId / attrGatewayIdentifier are this construct's own
+    // live CFN attributes, not hand-typed strings). No GetWorkloadAccessToken statement
+    // is added: that's only required for TEMPORAL policies (a policy session ID
+    // supplied per-call), which this Gateway doesn't use.
+    //
+    // The devguide's own two-statement split puts AuthorizeAction/PartiallyAuthorizeActions
+    // only on [policy-engine, gateway] ARNs, both assumed to already exist. TWO real,
+    // live CREATE_FAILED errors caught this doesn't hold at CREATE time, each naming a
+    // DIFFERENT resource as the one denied (the same "deny message only ever reports
+    // the first unauthorized resource" texture Tier 1's outbound-auth fix hit):
+    // attaching a PolicyEngineConfiguration to a brand-new Gateway runs a
+    // "GenesisPolicyEngineCheck" that calls AuthorizeAction FIRST against the POLICY
+    // ENGINE alone (deny #1: "...GenesisPolicyEngineCheck is not authorized to perform:
+    // bedrock-agentcore:AuthorizeAction on resource: policy-engine/..."), then AGAIN
+    // against the GATEWAY'S OWN ARN (deny #2, after granting the first: "...resource:
+    // gateway/tier2-remediation-gateway-yh8rlwzygf...") -- even though the Gateway does
+    // not exist yet at the moment this check runs. AWS::BedrockAgentCore::Gateway always
+    // appends a random suffix to the given `name` (confirmed live from deny #2's exact
+    // resource string: name "tier2-remediation-gateway" -> ID
+    // "tier2-remediation-gateway-yh8rlwzygf"), so the exact Gateway ARN genuinely cannot
+    // be known before CREATE -- there is no exact-ARN form available here, the same
+    // class of bootstrapping gap Tier 1's Secrets Manager grant hit for the outbound-auth
+    // credential provider's secret name. A name-PREFIX wildcard, scoped to THIS stack's
+    // own gateway name only (never service- or account-wide), is the narrowest thing
+    // that actually gets through Genesis; the exact-ARN grant on
+    // Tier2GatewayAuthorizationPolicy below still exists for the real post-creation
+    // runtime-invocation checks, so the wildcard's only job is bootstrapping CREATE.
+    tier2GatewayRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'PolicyEngineConfiguration',
+      actions: [
+        'bedrock-agentcore:GetPolicyEngine',
+        'bedrock-agentcore:AuthorizeAction',
+        'bedrock-agentcore:PartiallyAuthorizeActions',
+      ],
+      resources: [
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:policy-engine/${tier2Engine.attrPolicyEngineId}`,
+        `arn:aws:bedrock-agentcore:${this.region}:${this.account}:gateway/tier2-remediation-gateway*`,
+      ],
+    }));
+
+    // Hyphens only, no underscores -- AWS::BedrockAgentCore::GatewayTarget's Name must
+    // match ^([0-9a-zA-Z][-]?){1,100}$ (caught live by `cdk synth`'s own template
+    // validation, 2026-10-22, not assumed).
+    const TIER2_TARGET = 'tier2-remediation';
+    const TIER2_TOOL = 'set_feature_flag';
+
+    const tier2Gateway = new agentcore.CfnGateway(this, 'Tier2Gateway', {
+      name: 'tier2-remediation-gateway',
+      protocolType: 'MCP',
+      roleArn: tier2GatewayRole.roleArn,
+      authorizerType: 'CUSTOM_JWT',
+      authorizerConfiguration: {
+        // Only the Tier2ExecutorClient's tokens are even ACCEPTED at the Gateway's JWT
+        // authorizer -- neither agent client can present a valid token here at all,
+        // before Cedar is ever consulted. Defence in depth, not the only gate.
+        customJwtAuthorizer: { discoveryUrl, allowedClients: [tier2ExecutorClient.userPoolClientId] },
+      },
+      policyEngineConfiguration: { arn: tier2Engine.attrPolicyEngineArn, mode: 'ENFORCE' },
+    });
+
+    // DELIBERATELY a separate iam.Policy, not tier2GatewayRole.addToPolicy(): that call
+    // merges into the role's single auto-generated DefaultPolicy, which the Gateway
+    // itself already depends on (via the explicit addDependency below, needed so
+    // GetPolicyEngine permission exists before Gateway creation calls it). This
+    // statement references the Gateway's OWN attrGatewayIdentifier, so folding it into
+    // DefaultPolicy would make DefaultPolicy depend on the Gateway too -- a real
+    // circular dependency CloudFormation validation caught live at `cdk synth`
+    // ("Tier2GatewayRoleDefaultPolicy -> Tier2Gateway -> Tier2GatewayRoleDefaultPolicy"),
+    // the same class of bug Tier 1's MonitoringCrossInvokePolicy comment documents for
+    // the runtimes. A standalone Policy construct naturally depends on the Gateway
+    // (it needs the Gateway's ARN to exist) without the Gateway depending back on it.
+    new iam.Policy(this, 'Tier2GatewayAuthorizationPolicy', {
+      roles: [tier2GatewayRole],
+      statements: [new iam.PolicyStatement({
+        sid: 'PolicyEngineAuthorization',
+        actions: ['bedrock-agentcore:AuthorizeAction', 'bedrock-agentcore:PartiallyAuthorizeActions'],
+        resources: [
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:policy-engine/${tier2Engine.attrPolicyEngineId}`,
+          `arn:aws:bedrock-agentcore:${this.region}:${this.account}:gateway/${tier2Gateway.attrGatewayIdentifier}`,
+        ],
+      })],
+    });
+
+    const tier2Target = new agentcore.CfnGatewayTarget(this, 'Tier2Target', {
+      name: TIER2_TARGET,
+      gatewayIdentifier: tier2Gateway.attrGatewayIdentifier,
+      targetConfiguration: {
+        mcp: {
+          lambda: {
+            lambdaArn: setFeatureFlagFn.functionArn,
+            toolSchema: {
+              inlinePayload: [{
+                name: TIER2_TOOL,
+                description: 'Set a feature-flag SSM parameter to a new value. Only ever reaches '
+                  + 'this Lambda if the Cedar policy already authorised the call -- the policy, '
+                  + 'not this description, is the enforcement boundary.',
+                inputSchema: {
+                  type: 'object',
+                  properties: {
+                    parameter_name: { type: 'string', description: 'Full SSM parameter name to set' },
+                    new_value: { type: 'string', description: '"true" or "false"' },
+                    approved: { type: 'string', description: 'Must be the literal string "true" -- checked by the Cedar policy before this tool is ever invoked' },
+                    approver: { type: 'string', description: 'Informational only, never trusted for authorization' },
+                    approved_at: { type: 'string', description: 'Informational only, never trusted for authorization' },
+                  },
+                  required: ['parameter_name', 'new_value', 'approved'],
+                },
+              }],
+            },
+          },
+        },
+      },
+      credentialProviderConfigurations: [{ credentialProviderType: 'GATEWAY_IAM_ROLE' }],
+    });
+
+    // Same CloudFormation-ordering fix Tier 1 needed for its Runtimes (see
+    // MonitoringCrossInvokePolicy's comment above) and the agentcore-acts-as-the-user
+    // sibling repo needed for its own Gateways: the role's DefaultPolicy is a SEPARATE
+    // CloudFormation resource with no implicit ordering against the Gateway, so without
+    // an explicit dependency CloudFormation can create the Gateway before the role's
+    // permissions are attached, and Policy Engine attachment fails with
+    // "Access denied ... GetPolicyEngine" even though the policy document is correct.
+    const tier2GatewayDefaultPolicy = tier2GatewayRole.node.findChild('DefaultPolicy');
+    if (tier2GatewayDefaultPolicy) tier2Gateway.node.addDependency(tier2GatewayDefaultPolicy);
+
+    // The Cedar policy itself. A single statement covers BOTH required denial tests:
+    // approved != "true" denies regardless of resource (the no-approval test), and any
+    // parameter_name other than the one tagged resource denies regardless of approval
+    // (the untagged-resource test) -- there is no permit for either case, so AgentCore's
+    // default-deny applies, exactly like the sibling repo's "any other repo has no
+    // permit" case.
+    const tier2Policy = new agentcore.CfnPolicy(this, 'Tier2ApprovalPolicy', {
+      name: 'tier2_feature_flag_requires_approval',
+      policyEngineId: tier2Engine.attrPolicyEngineId,
+      definition: {
+        cedar: {
+          statement: `permit(
+  principal is AgentCore::OAuthUser,
+  action == AgentCore::Action::"${TIER2_TARGET}___${TIER2_TOOL}",
+  resource == AgentCore::Gateway::"${tier2Gateway.attrGatewayArn}"
+) when {
+  context.input.parameter_name == "${maintenanceFlagParam.parameterName}" &&
+  context.input.approved == "true" &&
+  (context.input.new_value == "true" || context.input.new_value == "false")
+};`,
+        },
+      },
+    });
+    // Policy validation calls the Gateway (authorized as InvokeGateway on the deploying
+    // principal, which already holds AdministratorAccess in this account) -- same
+    // dependency the sibling repo's policies need on their guarded gateway/target.
+    tier2Policy.addResourceDependency(tier2Gateway);
+    tier2Policy.addResourceDependency(tier2Target);
+
     new cdk.CfnOutput(this, 'Region', { value: this.region });
     new cdk.CfnOutput(this, 'Account', { value: this.account });
     new cdk.CfnOutput(this, 'UserPoolId', { value: pool.userPoolId });
@@ -328,5 +566,13 @@ export class A2AIncidentResponseStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'MonitoringRuntimeArn', { value: monitoringRuntime.attrAgentRuntimeArn });
     new cdk.CfnOutput(this, 'RemediationRuntimeArn', { value: remediationRuntime.attrAgentRuntimeArn });
     new cdk.CfnOutput(this, 'OAuth2CredentialProviderArn', { value: monitoringToRemediationCredentialProvider.attrCredentialProviderArn });
+
+    // Tier 2 outputs.
+    new cdk.CfnOutput(this, 'Tier2ExecutorClientId', { value: tier2ExecutorClient.userPoolClientId });
+    new cdk.CfnOutput(this, 'Tier2GatewayUrl', { value: tier2Gateway.attrGatewayUrl });
+    new cdk.CfnOutput(this, 'Tier2GatewayArn', { value: tier2Gateway.attrGatewayArn });
+    new cdk.CfnOutput(this, 'Tier2PolicyEngineArn', { value: tier2Engine.attrPolicyEngineArn });
+    new cdk.CfnOutput(this, 'MaintenanceFlagParameterName', { value: maintenanceFlagParam.parameterName });
+    new cdk.CfnOutput(this, 'UntaggedFlagParameterName', { value: untaggedFlagParam.parameterName });
   }
 }

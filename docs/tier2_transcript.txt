@@ -1,0 +1,53 @@
+======================================================================
+Tier 2: human-approved, Cedar-policy-enforced reversible remediation
+======================================================================
+
+== Remediation agent's PROPOSAL (matched runbook: Elevated error rate) ==
+  finding: Elevated error rate on checkout-api-test: SyntheticErrorRate reached 97.0 (threshold 80.0), alarm a2a-incident-demo-checkout-api-test-errors has been in ALARM since 2026-10-22T19:48:06.542000+11:00.
+{
+  "type": "set_feature_flag",
+  "parameter_name": "/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode",
+  "new_value": "true",
+  "description": "Enable the checkout-api-test maintenance-mode flag to shed load onto a degraded-but-safe path while the error rate is investigated. Safe and reversible: set back to \"false\" once resolved (Tier 2's rollback step does exactly this and verifies it).",
+  "risk": "low -- a feature flag read by the (synthetic) service, not a destructive action; requires human approval and is enforced by an AgentCore Gateway Cedar policy, not executed directly by this agent."
+}
+
+== TEST 1: attempt the action WITHOUT approval ==
+  [PASS] DENIED -- {"code": -32002, "message": "Tool Execution Denied: Tool call not allowed due to policy enforcement [No policy applies to the request (denied by default).]"}
+  parameter unchanged: 'false' -> 'false'
+
+== TEST 2: approved=true, but against the UNTAGGED resource ==
+  [PASS] DENIED -- {"code": -32002, "message": "Tool Execution Denied: Tool call not allowed due to policy enforcement [No policy applies to the request (denied by default).]"}
+  parameter unchanged: 'false' -> 'false'
+
+======================================================================
+APPROVAL REQUIRED
+======================================================================
+Proposed by remediation agent: Enable the checkout-api-test maintenance-mode flag to shed load onto a degraded-but-safe path while the error rate is investigated. Safe and reversible: set back to "false" once resolved (Tier 2's rollback step does exactly this and verifies it).
+  parameter: /a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode -> 'true'
+  (non-interactive session -- no human TTY present; decision supplied via env_var_non_interactive(TIER2_APPROVAL): 'y'. Run interactively to approve at a real prompt instead.)
+  LOGGED: approver=arn:aws:sts::129875820670:assumed-role/AWSReservedSSO_AdministratorAccess_5117d3a3f5d993cc/raj decision='y' approved=True at 2026-10-22T08:48:32.466648+00:00 -> /Users/rajmurugan/Documents/personal/agentcore-a2a-incident-response/docs/tier2_approval_log.jsonl
+
+== TEST 3: approved call against the correct, tagged resource ==
+  [PASS] ALLOWED -- [{"type": "text", "text": "{\"parameter_name\":\"/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode\",\"previous_value\":\"false\",\"requested_value\":\"true\",\"confirmed_value\":\"true\",\"executed_at_
+  INDEPENDENTLY VERIFIED via a direct ssm:GetParameter call (not the Lambda's own return value): 'false' -> 'true'
+
+== ROLLBACK: reset the flag back to its PRIOR value ==
+
+======================================================================
+APPROVAL REQUIRED
+======================================================================
+ROLLBACK of the above action: reset /a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode back to 'false'.
+  parameter: /a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode -> 'false'
+  (non-interactive session -- no human TTY present; decision supplied via env_var_non_interactive(TIER2_APPROVAL): 'y'. Run interactively to approve at a real prompt instead.)
+  LOGGED: approver=arn:aws:sts::129875820670:assumed-role/AWSReservedSSO_AdministratorAccess_5117d3a3f5d993cc/raj decision='y' approved=True at 2026-10-22T08:48:35.610793+00:00 -> /Users/rajmurugan/Documents/personal/agentcore-a2a-incident-response/docs/tier2_approval_log.jsonl
+  [PASS] ALLOWED -- [{"type": "text", "text": "{\"parameter_name\":\"/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode\",\"previous_value\":\"true\",\"requested_value\":\"false\",\"confirmed_value\":\"false\",\"executed_at
+  INDEPENDENTLY VERIFIED via a direct ssm:GetParameter call: now 'false', matches the pre-action value 'false': True
+
+======================================================================
+  [PASS] no-approval attempt is denied (by Cedar, not by prompt text) -- {"code": -32002, "message": "Tool Execution Denied: Tool call not allowed due to policy enforcement [No policy applies to the request (denied by default).]"}
+  [PASS] untagged-resource attempt is denied by Cedar -- {"code": -32002, "message": "Tool Execution Denied: Tool call not allowed due to policy enforcement [No policy applies to the request (denied by default).]"}
+  [PASS] approved execution succeeds, independently verified -- [{"type": "text", "text": "{\"parameter_name\":\"/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode\",\"previous_value\":\"false\",\"requested_value\":\"true\",\"confirmed_value\":\"true\",\"executed_at_
+  [PASS] rollback executes and is independently verified -- [{"type": "text", "text": "{\"parameter_name\":\"/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode\",\"previous_value\":\"true\",\"requested_value\":\"false\",\"confirmed_value\":\"false\",\"executed_at
+
+4/4 required Tier 2 behaviours verified.

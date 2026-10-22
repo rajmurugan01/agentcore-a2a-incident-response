@@ -51,12 +51,23 @@ demo:
 	REM_SECRET=$$(aws cognito-idp describe-user-pool-client --user-pool-id $$USER_POOL_ID --client-id $$REM_CLIENT_ID --query 'UserPoolClient.ClientSecret' --output text); \
 	MONITORING_CLIENT_SECRET=$$MON_SECRET REMEDIATION_CLIENT_SECRET=$$REM_SECRET .venv/bin/python3 demo/demo.py | tee docs/transcript.txt
 
+# Tier 2 (approved 2026-10-22): human-approved, Cedar-policy-enforced reversible
+# remediation. Reads cdk/cdk.outputs.json directly (region/gateway URL/client IDs);
+# fetches the Tier2ExecutorClient secret live via DescribeUserPoolClient, same
+# never-in-a-plaintext-output discipline as `demo`. Run `make tier2-demo` with a real
+# terminal attached to approve interactively; piped/non-interactive runs fall back to
+# the TIER2_APPROVAL=y/n env var and log that fact (see scripts/tier2_demo.py).
+tier2-demo:
+	.venv/bin/python3 scripts/tier2_demo.py | tee docs/tier2_transcript.txt
+
 # Tier 1 criterion 9: also removes the test metric/alarm, not just the AgentCore/Cognito
 # stack -- independently verified (describe-alarms / list-metrics), not just exit codes.
 # Runs BEFORE cdk destroy: the incident alarm/metric are in this account regardless of
-# whether the stack still exists, and describe-alarms works either way.
+# whether the stack still exists, and describe-alarms works either way. Tier 2's own
+# resources (Gateway, Policy Engine, Policy, both SSM parameters) are part of the same
+# CDK stack, so `cdk destroy` below removes them too -- no separate teardown script.
 destroy:
 	.venv/bin/python3 scripts/teardown_incident.py
 	cd cdk && npx cdk destroy --force
 
-.PHONY: install deploy incident demo destroy
+.PHONY: install deploy incident demo tier2-demo destroy

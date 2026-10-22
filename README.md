@@ -14,6 +14,27 @@ rajmurugan.com LangGraph-vs-AgentCore post instead of a new OpenAI API key), and
 static runbook knowledge source instead of JIRA ticketing or Tavily web search. No new
 paid third-party API signups.
 
+## Status: Tier 2 shipped -- human-approved, Cedar-policy-enforced reversible remediation (2026-10-22)
+
+Approved by Raj same-day ("go tier 2") right after Tier 1's fix was independently
+verified. The pitch: two frameworks detect and propose; a human approves; policy
+enforces -- deliberately short of full autonomy. The remediation agent now proposes a
+structured action (`propose_remediation_action()` in `agents/remediation_agent/agent.py`,
+driven by a new `proposed_action` field on `runbooks.json`'s `error_rate` entry) but holds
+no credential able to execute one; execution only happens through a new AgentCore Gateway
+with a Cedar policy (ENFORCE mode) scoped to one real, tagged test SSM parameter
+(`/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode`), behind a logged
+human approval. All four required acceptance criteria passed live on the first full
+`make tier2-demo` run: a logged approval with a real IAM approver identity and timestamp, a
+no-approval attempt denied by Cedar (not a prompt), an untagged-resource attempt denied by
+Cedar, and a rollback that was independently re-verified via a direct `ssm:GetParameter`
+call, not just trusted from the Lambda's own return value. Full transcript:
+`docs/tier2_transcript.txt`; approval log: `docs/tier2_approval_log.jsonl`; full reasoning
+and evidence: `docs/specs/agentcore-a2a-incident-response.md`'s Tier 2 section. See "Sharp
+edges I hit (2026-10-22, Tier 2)" below for what building Gateway + Policy for the first
+time in this repo (the sibling `agentcore-acts-as-the-user` repo had already built the same
+primitives once) actually took.
+
 ## Status: the incident is real now -- fixed, deployed, measured, torn down (2026-10-22)
 
 The 2026-10-21 build measured A2A transport mechanics for real but faked the "incident"
@@ -237,6 +258,55 @@ never actually sent the monitoring runtime a real A2A message.
    provider's own name only (never account- or service-wide), is the narrowest thing that
    actually deploys, since the random suffix is only assigned at creation time.
 
+## Sharp edges I hit (2026-10-22, Tier 2)
+
+Building AgentCore Gateway + Policy (Cedar) for the first time in THIS repo -- the sibling
+`agentcore-acts-as-the-user` repo had already built the same two primitives once, and its
+README/`cdk/lib/stack.ts` were read first, per the task brief, before writing any of this.
+Its documented traps (a role-vs-resource creation-order dependency; a Cedar `like`-match
+collision on a quoted group-claim string) didn't recur directly, but a genuinely new one
+did, specific to a Gateway that has a `policyEngineConfiguration` attached AT CREATE time
+(the sibling repo's guarded gateway attaches its policy engine the same way, but this
+build's exact IAM starting point -- scoped IDs from the first commit, not a wildcard caught
+in review afterwards -- is what surfaced it immediately rather than masking it):
+
+1. **A brand-new Gateway's own `CREATE` call runs a "GenesisPolicyEngineCheck" that calls
+   `AuthorizeAction` against the Gateway's OWN ARN before the Gateway exists.** Two real,
+   live `CREATE_FAILED` errors, in order: the first named the policy engine's ARN as the
+   blocker (fixed by adding `AuthorizeAction`/`PartiallyAuthorizeActions` on the
+   policy-engine ARN to the role's pre-creation `DefaultPolicy`, alongside
+   `GetPolicyEngine`); the second, after that fix, named the GATEWAY's own ARN instead --
+   `"...GenesisPolicyEngineCheck is not authorized to perform:
+   bedrock-agentcore:AuthorizeAction on resource:
+   gateway/tier2-remediation-gateway-yh8rlwzygf..."` -- even though the Gateway had not
+   finished being created yet. That exact string is also what proved
+   `AWS::BedrockAgentCore::Gateway` always appends a random suffix to the `name` you give
+   it (`tier2-remediation-gateway` -> `tier2-remediation-gateway-yh8rlwzygf`), so the real
+   ARN genuinely cannot be computed ahead of `CREATE` -- not a scoping mistake, a real
+   AWS-side bootstrapping gap, the same class Tier 1 hit for the outbound-auth credential
+   provider's Secrets Manager secret name. Fixed with a name-PREFIX wildcard
+   (`gateway/tier2-remediation-gateway*`), scoped to this stack's own gateway name only,
+   added to the SAME pre-creation statement purely to get through Genesis; the exact-ARN
+   grant for real runtime-invocation checks is a separate statement, added after the
+   Gateway exists (see `Tier2GatewayAuthorizationPolicy` in `cdk/lib/stack.ts`).
+2. **The equivalent of Tier 1's `MonitoringCrossInvokePolicy` circular-dependency bug,
+   caught by `cdk synth`'s OWN template validation before any deploy attempt this time** --
+   putting the Gateway-ARN-referencing authorization statement into the role's
+   auto-generated `DefaultPolicy` (which the Gateway already depends on, for
+   `GetPolicyEngine`) made `DefaultPolicy` depend on the Gateway too:
+   `Tier2GatewayRoleDefaultPolicy -> Tier2Gateway -> Tier2GatewayRoleDefaultPolicy`. Fixed
+   the same way -- a separate `iam.Policy` construct, not `role.addToPolicy()`.
+3. **`AWS::BedrockAgentCore::GatewayTarget`'s `Name` must match
+   `^([0-9a-zA-Z][-]?){1,100}$` -- no underscores.** `cdk synth`'s template validation
+   caught `tier2_remediation` before any deploy attempt; renamed to `tier2-remediation`.
+   The nested tool name (`set_feature_flag`) is a different, unconstrained field and was
+   left underscored.
+
+None of these needed a deploy-and-retry cycle to diagnose -- two were caught by `cdk
+synth`'s own validation before `cdk deploy` ever ran, and the third (Genesis) resolved in
+two live attempts by reading the literal deny message each time, the same discipline Tier
+1's outbound-auth fix used.
+
 ## How it works
 
 - `cdk/` -- CDK (TypeScript) stack: one Cognito user pool with a resource server and two
@@ -273,11 +343,32 @@ never actually sent the monitoring runtime a real A2A message.
   (`a2a-sdk[http-server]==0.3.26`) in BOTH agents' requirements now -- it was missing
   entirely from `monitoring_agent`'s until 2026-10-22 (see sharp edges); the PyPI-default
   1.x line removed the `A2AStarletteApplication` module this code (and AWS's own sample)
-  is written against, so a loose `>=` pin is wrong for either agent.
+  is written against, so a loose `>=` pin is wrong for either agent. `propose_remediation_action()`
+  (added 2026-10-22, Tier 2) reuses `classify_finding()` to return the matched runbook's
+  structured `proposed_action` -- a PROPOSAL only, no LLM call and no AWS credential able
+  to execute anything; see Tier 2's Gateway/Policy below for the execution path.
 - `scripts/incident.py` / `scripts/teardown_incident.py` (added 2026-10-22) -- create and
   tear down the real, tagged test CloudWatch metric + alarm `make incident`/`make
   destroy` drive. See inline comments for why `TreatMissingData=ignore` and a 10s
   high-resolution period were chosen.
+- Tier 2 (added 2026-10-22): a third Cognito client-credentials client
+  (`Tier2ExecutorClient`), scoped to a THIRD resource-server scope (`tier2.execute`) that
+  neither agent client is granted -- the remediation agent can never reach this Gateway
+  even if it tried. `cdk/lib/stack.ts` also creates one real, tagged SSM parameter
+  (`/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode`) and one real,
+  deliberately UNTAGGED one (`/a2a-incident-demo/feature-flags/untagged-example`, used
+  only for the denial test), a `CfnPolicyEngine` + `CfnGateway` (ENFORCE mode) + a single
+  Lambda `CfnGatewayTarget` (`set_feature_flag`, in `lambda/set_feature_flag.py`, IAM-scoped
+  to read/write ONLY the one tagged parameter), and one Cedar `CfnPolicy`
+  (`Tier2ApprovalPolicy`) that permits the tool call only when `context.input.approved ==
+  "true"` and `context.input.parameter_name` is exactly the tagged parameter's name --
+  anything else default-denies. `scripts/tier2_demo.py` drives the whole flow: imports
+  `propose_remediation_action()` in-process, logs a real approval (interactive `input()`
+  when a TTY is attached, `TIER2_APPROVAL` env var otherwise -- see
+  `docs/tier2_approval_log.jsonl`), calls the Gateway via raw JSON-RPC `tools/call` (same
+  technique the `agentcore-acts-as-the-user` sibling repo's `demo.py` uses), and
+  independently re-verifies every state change via a direct `ssm:GetParameter` call rather
+  than trusting the Gateway/Lambda's own response.
 - `demo/demo.py` -- runs all four comms patterns (a, b, c-control, c-real)
   `RUNS_PER_PATTERN` times each against the real deployed stack, checks each pattern-(c)-
   real run's finding against ground truth (`describe-alarms`/`get-metric-statistics`,
@@ -292,14 +383,15 @@ never actually sent the monitoring runtime a real A2A message.
 
 ## Not in scope
 
-AgentCore Gateway, Memory, and Observability primitives from the AWS sample -- this repo
-only exercises Runtime, the A2A protocol layer, and (as of 2026-10-22) AgentCore
-Identity's outbound-auth credential-provider mechanism specifically for the
-agent-to-agent hand-off, by design (see the task scope this was built against). Not a
-production reference architecture: no VPC isolation, no WAF in front of the Cognito
-domain, no secret rotation. Not the AWS sample 1:1 -- no Google ADK host agent, no JIRA,
-no Tavily. Tier 2 (human-approved, Gateway+Cedar-policy-enforced reversible remediation)
-remains proposed-only in the spec, not built.
+AgentCore Memory and Observability primitives from the AWS sample -- this repo exercises
+Runtime, the A2A protocol layer, AgentCore Identity's outbound-auth credential-provider
+mechanism (for the agent-to-agent hand-off), and, as of 2026-10-22, AgentCore Gateway +
+Policy (Cedar) for Tier 2's human-approved execution step, by design (see the task scope
+this was built against). Not a production reference architecture: no VPC isolation, no WAF
+in front of the Cognito domain, no secret rotation. Not the AWS sample 1:1 -- no Google ADK
+host agent, no JIRA, no Tavily. Unattended remediation of real resources remains explicitly
+out of scope -- Tier 2's whole point is a human approval gate IN the loop, not removing
+one.
 
 ## Cost
 
@@ -331,6 +423,17 @@ Pattern (b)'s 5 calls never reach the model: as the finding above describes, the
 remediation container is a pure A2A JSON-RPC server and rejects pattern (b)'s raw,
 non-A2A payload as a validation error before any LangGraph/Bedrock call happens -- its
 ~8.2-8.5s is pure AgentCore Runtime + Cognito-auth round-trip latency, not model latency.
+
+### Measured (2026-10-22, Tier 2's `make tier2-demo` run -- `docs/tier2_transcript.txt`)
+
+Zero Bedrock model invocations this run -- `propose_remediation_action()` only calls the
+local, non-LLM `classify_finding()`; confirmed by pulling `AWS/Bedrock`
+`InputTokenCount`/`OutputTokenCount` CloudWatch metrics for the session window (both `0`).
+The only billed calls: 4 AgentCore Gateway invocations (2 denied, 2 allowed) and 4 Policy
+authorisations, at published list rates ($5/million invocations, $25/million
+authorisations) -- a few hundredths of a cent. SSM Parameter Store and the two
+`SetFeatureFlagFn` Lambda invocations are free-tier eligible. Total for this run: well
+under $0.01, consistent with the spec's "well under $1" estimate.
 
 Session total, pulled from this session's real `AWS/Bedrock` CloudWatch usage metrics
 (`InputTokenCount`/`OutputTokenCount`, dimensioned by `ModelId`), covering every real
@@ -375,13 +478,18 @@ own `.venv`), Docker (for the `linux/arm64` image builds, and the Docker daemon 
 running, not just installed), and `AWS_PROFILE` set to an identity with permission to
 create Cognito, IAM, ECR and `AWS::BedrockAgentCore::*` resources.
 
-    make install   # cdk/ npm install + a python3.12 .venv with both agents' full deps
-    make deploy    # Cognito, two ECR images (CDK assets), two AgentCore Runtimes, IAM,
-                    # the OAuth2 credential provider
-    make incident  # creates a REAL tagged test CloudWatch metric + alarm, drives it
-                    # into ALARM for real, writes docs/incident.json (ground truth)
-    make demo      # runs all four comms patterns, writes docs/transcript.txt
-    make destroy   # removes the test alarm/metric AND the AgentCore/Cognito stack
+    make install     # cdk/ npm install + a python3.12 .venv with both agents' full deps
+    make deploy      # Cognito, two ECR images (CDK assets), two AgentCore Runtimes, IAM,
+                      # the OAuth2 credential provider, AND (Tier 2) the Gateway + Policy
+                      # Engine + Lambda target + two SSM parameters
+    make incident    # creates a REAL tagged test CloudWatch metric + alarm, drives it
+                      # into ALARM for real, writes docs/incident.json (ground truth)
+    make demo        # runs all four Tier 1 comms patterns, writes docs/transcript.txt
+    make tier2-demo  # Tier 2: propose -> approve (interactive prompt, or TIER2_APPROVAL=y/n
+                      # non-interactively) -> Cedar-enforced execute -> rollback, writes
+                      # docs/tier2_transcript.txt and appends docs/tier2_approval_log.jsonl
+    make destroy     # removes the test alarm/metric AND the whole AgentCore/Cognito/
+                      # Gateway/Policy stack (Tier 2's resources are part of the same stack)
 
 The region is pinned with an unconditional `:=` in the Makefile, not `?=` -- `make
 incident`'s first run in this session created the test alarm in the wrong region because
@@ -397,18 +505,32 @@ running container (see "How it works").
 
 ## Teardown
 
-Verified after `make destroy` on 2026-10-22, not just trusted from exit codes:
-`aws cloudformation describe-stacks` for this stack returns `ValidationError: ... does not
-exist`; `aws bedrock-agentcore-control list-agent-runtimes` and `list-oauth2-credential-
-providers` both return empty lists; `aws cognito-idp list-user-pools` no longer lists
-this stack's pool; `aws cloudwatch describe-alarms` for the test alarm name returns empty
-(deleted by `scripts/teardown_incident.py` before `cdk destroy` ran). One thing that is
-NOT removed, by design, and this is a real AWS limitation, not a gap in this repo's
-scripts: CloudWatch has **no delete-metric API at all** -- `list-metrics` still shows the
-test metric's metadata after teardown, and will keep doing so until it ages out of
-CloudWatch's own retention/visibility window; there is no action this repo (or anything
-else) can take to remove it sooner. Same honesty standard as the ECR note below: reported
-as what it actually is, not hidden.
+Verified after `make destroy` on 2026-10-22 (re-verified again after the Tier 2 build the
+same day), not just trusted from exit codes: `aws cloudformation describe-stacks` for this
+stack returns `ValidationError: Stack with id AgentcoreA2AIncidentResponse does not
+exist`; `aws bedrock-agentcore-control list-agent-runtimes` returns no
+`monitoring_agent_a2a`/`remediation_agent_a2a`; `list-oauth2-credential-providers` returns
+empty; `aws cognito-idp list-user-pools` no longer lists this stack's pool (only unrelated
+pools from other projects in the same account remain); `aws cloudwatch describe-alarms`
+for the test alarm name returns empty (deleted by `scripts/teardown_incident.py` before
+`cdk destroy` ran). One thing that is NOT removed, by design, and this is a real AWS
+limitation, not a gap in this repo's scripts: CloudWatch has **no delete-metric API at
+all** -- `list-metrics` still shows the test metric's metadata after teardown, and will
+keep doing so until it ages out of CloudWatch's own retention/visibility window; there is
+no action this repo (or anything else) can take to remove it sooner. Same honesty standard
+as the ECR note below: reported as what it actually is, not hidden.
+
+**Tier 2's own resources, independently re-verified gone in the same post-destroy pass:**
+`aws bedrock-agentcore-control list-gateways` no longer lists `tier2-remediation-gateway*`
+(only the unrelated sibling-repo gateways `acts-as-user-open`/`acts-as-user-guarded`
+remain, confirming the query itself works and isn't silently empty for the wrong reason);
+`list-policy-engines` no longer lists `tier2_remediation_engine*` (only the sibling repo's
+own `acts_as_user_engine` remains); `aws ssm get-parameters` for both
+`/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode` and
+`/a2a-incident-demo/feature-flags/untagged-example` returns an empty `Parameters` list for
+both -- gone, including the deliberately-untagged one. The `SetFeatureFlagFn` Lambda and
+its IAM roles went with the stack; nothing Tier 2 added needed a separate teardown step
+outside `cdk destroy`.
 
 A second, unrelated thing `cdk destroy` deliberately does NOT remove: the CDK bootstrap's
 shared `cdk-hnb659fds-container-assets-<account>-<region>` ECR repository still holds the

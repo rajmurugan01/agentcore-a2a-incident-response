@@ -125,6 +125,29 @@ def remediate_direct(finding: str) -> str:
     return result["recommendation"]
 
 
+def propose_remediation_action(finding: str) -> dict | None:
+    """Tier 2 (approved 2026-10-22): the remediation agent PROPOSES a structured action --
+    it does NOT execute one. Returns the matched runbook's `proposed_action` (if any) plus
+    which runbook matched and the raw finding, or None if the matched runbook has no
+    proposed_action (e.g. "default" -- an unclassified finding should never get an
+    automated action proposed for it at all, not even one awaiting approval).
+
+    This function has no AWS credentials of any kind -- it only reads the local
+    runbooks.json. The actual execution path (scripts/tier2_demo.py calling the Tier 2
+    AgentCore Gateway) is a completely separate credential (Tier2ExecutorClient, see
+    cdk/lib/stack.ts) that this agent's role is never granted. Proposing and executing
+    are different identities on purpose."""
+    _log_step("propose_action_start", finding=finding)
+    state = classify_finding({"finding": finding, "runbook_key": "", "recommendation": ""})
+    runbook_key = state["runbook_key"]
+    runbook = RUNBOOKS[runbook_key]
+    action = runbook.get("proposed_action")
+    _log_step("propose_action_done", runbook_key=runbook_key, has_action=action is not None)
+    if action is None:
+        return None
+    return {"runbook_key": runbook_key, "runbook_title": runbook["title"], "finding": finding, "proposed_action": action}
+
+
 class RemediationAgentExecutor(AgentExecutor):
     """Bridges the LangGraph graph into the a2a-sdk's AgentExecutor contract."""
 

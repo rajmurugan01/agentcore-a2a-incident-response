@@ -17,7 +17,14 @@
       "Check the most recent deploy timestamp against when the error rate started climbing.",
       "If tied to a deploy, roll back first and investigate second -- restoring service comes before root cause.",
       "If not tied to a deploy, check a dependency (database, downstream API) for its own alarms."
-    ]
+    ],
+    "proposed_action": {
+      "type": "set_feature_flag",
+      "parameter_name": "/a2a-incident-demo/feature-flags/checkout-api-test-maintenance-mode",
+      "new_value": "true",
+      "description": "Enable the checkout-api-test maintenance-mode flag to shed load onto a degraded-but-safe path while the error rate is investigated. Safe and reversible: set back to \"false\" once resolved (Tier 2's rollback step does exactly this and verifies it).",
+      "risk": "low -- a feature flag read by the (synthetic) service, not a destructive action; requires human approval and is enforced by an AgentCore Gateway Cedar policy, not executed directly by this agent."
+    }
   },
   "latency": {
     "match": ["latency", "p99", "p95", "slow", "timeout"],
