@@ -470,6 +470,43 @@ IAM-fix redeploys, `make incident`, two full `make demo` runs, `make destroy`): 
 still dominated by rounding in AgentCore Runtime compute's per-second billing and a
 handful of extra debugging model calls, not by anything structurally expensive.
 
+### Session note (2026-10-23): what the "~15s of A2A protocol mechanics" claim actually is
+
+The companion blog post attributed "~15 of 25.3 seconds (about 60%)" of the real
+detect-and-handoff flow to "A2A protocol mechanics" -- fetching the token, fetching the
+agent card, and the network dispatch. A technical reviewer pushed back with this repo's
+own numbers (`native invoke` 8.4s median vs `direct call` 2.4s median for a single
+AgentCore Runtime hop doing zero protocol work) and proposed a sharper explanation:
+AgentCore Runtime uses per-session microVM isolation, and because `agent.py`'s and
+`demo.py`'s `_bearer_headers` both mint a brand-new `uuid4()` session id on EVERY call,
+every measured call was forcing a fresh cold start.
+
+Redeployed the stack and ran a new one-off, `scripts/warm_session_experiment.py`, 5 cold +
+5 warm reps each for the two steps the post blames most (card-fetch GET, message/send
+POST) -- full raw output in `docs/warm_session_transcript.txt`:
+
+| Step | cold median | warm median | delta |
+|---|---|---|---|
+| `GET /.well-known/agent-card.json` | 8.318s | 0.982s | -7.335s |
+| `POST message/send` (real LangGraph + Bedrock call) | 10.539s | 3.327s | -7.212s |
+
+**Confirmed, not partially: cold-start, not A2A wire mechanics, is the dominant cost.** A
+cold card-fetch (8.318s) is statistically the same number as `native invoke`'s own 8.4s --
+both are one AgentCore Runtime hop on a never-used session. Warmed, the identical
+729-byte card-fetch drops to 0.982s. The two cold numbers alone (8.318s + 10.539s =
+18.857s) land almost exactly on the `(c) full A2A -- CONTROL` pattern's measured 18.831s
+median above, because that pattern IS a card-fetch-on-one-session followed by a
+message/send-on-another-session -- same mechanism, two different measurements. Of that
+18.8s, ~14.5s is cold-start (the two deltas above); only ~4.3s is real work, and most of
+that 4.3s is the message/send step's genuine LangGraph+Bedrock compute, not transport.
+Full reasoning, the idle-gap probe (a session stayed warm through a 90-second idle gap,
+single data point), and a region mistake caught and fixed mid-session: see
+`docs/specs/agentcore-a2a-incident-response.md`'s "Warm-vs-cold session investigation"
+note. The "~15s of A2A protocol mechanics" framing is the blog post's, not this README's
+-- this repo's own numbers above (the measured patterns and their medians) are left as
+originally measured, not edited, so the evidence trail stays intact; the blog post's prose
+is for Raj to revise based on this finding, not this session.
+
 ## Run it
 
 Needs an AWS account with CDK bootstrapped in us-east-1, Node 22+, Python 3.12 specifically
@@ -506,7 +543,8 @@ running container (see "How it works").
 ## Teardown
 
 Verified after `make destroy` on 2026-10-22 (re-verified again after the Tier 2 build the
-same day), not just trusted from exit codes: `aws cloudformation describe-stacks` for this
+same day, and again after the 2026-10-23 warm-vs-cold session investigation redeploy --
+same independent checks each time), not just trusted from exit codes: `aws cloudformation describe-stacks` for this
 stack returns `ValidationError: Stack with id AgentcoreA2AIncidentResponse does not
 exist`; `aws bedrock-agentcore-control list-agent-runtimes` returns no
 `monitoring_agent_a2a`/`remediation_agent_a2a`; `list-oauth2-credential-providers` returns

@@ -1,7 +1,10 @@
 # Spec: AgentCore A2A cross-framework incident-response demo
 Status: Tier 1 shipped and verified live 2026-10-22 (see "Tier 1 fix session note" below).
 Tier 2 shipped and verified live 2026-10-22 (see "Tier 2 build session note" below).
-Date: 2026-10-19, revised 2026-10-22   Domain: Professional (public companion repo for rajmurugan.com)
+Warm-vs-cold session investigation run and verified live 2026-10-23, confirming cold-start
+(not A2A protocol mechanics) as the dominant cost (see "Warm-vs-cold session
+investigation" below).
+Date: 2026-10-19, revised 2026-10-23   Domain: Professional (public companion repo for rajmurugan.com)
 Repo: agentcore-a2a-incident-response
 
 ## Problem / why now
@@ -392,3 +395,87 @@ same account's admin role) carried over directly and saved real time.
   `input()` path is real and will prompt a human who runs `make tier2-demo` from an actual
   terminal; Raj's own "go tier 2" is what authorised building and exercising this flow in
   this session, not a substitute for the per-action log itself.
+
+## Warm-vs-cold session investigation (2026-10-23) -- confirms cold-start, not "A2A protocol", is the dominant cost
+
+A technical reviewer pushed back on the companion blog post's claim that "~15 of 25.3
+seconds (about 60%) is A2A protocol mechanics", pointing at this repo's own numbers:
+`native invoke` (one AgentCore Runtime hop, no card fetch, no envelope, no model call)
+already costs 8.4s median vs `direct call`'s 2.4s median -- a ~6s cost just for touching
+AgentCore Runtime once, before any protocol work. Their hypothesis: AgentCore Runtime
+uses per-session microVM isolation, and because `agent.py`'s `_bearer_headers` and
+`demo.py`'s own `_bearer_headers` both generate a brand-new `uuid4()` for
+`X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` on EVERY single HTTP call (confirmed by
+reading both files before changing anything), every measured call forces a real cold
+start -- and that cold start, not A2A's own wire mechanics, is most of what the post
+blamed on "the A2A protocol".
+
+**Redeployed the stack, ran `scripts/warm_session_experiment.py` (new, one-off) against
+the real remediation runtime, 5 cold + 5 warm reps per step** (cold = brand-new session id
+used once; warm = one throwaway warm-up call on a session id immediately followed by the
+measured call on that SAME id), full raw output in `docs/warm_session_transcript.txt`:
+
+| Step | cold min/median/max | warm min/median/max | median delta |
+|---|---|---|---|
+| `GET /.well-known/agent-card.json` | 8.242s / 8.318s / 8.805s | 0.905s / 0.982s / 1.137s | **-7.335s** |
+| `POST message/send` (real LangGraph + Bedrock Haiku call) | 10.506s / 10.539s / 10.648s | 3.225s / 3.327s / 3.558s | **-7.212s** |
+
+**Conclusion: the reviewer's hypothesis is confirmed, not partially -- cold-start is the
+dominant cost, and it explains almost all of what the post attributed to "A2A protocol
+mechanics".** A cold card-fetch (8.318s median) lands within noise of `native invoke`'s
+own 8.4s median -- both are, structurally, exactly the same thing: one AgentCore Runtime
+hop on a never-before-used session. Warmed, the SAME card-fetch (729 bytes, no change to
+payload or endpoint) drops to 0.982s median -- there is no credible wire-protocol or
+JSON-RPC explanation for a 729-byte GET costing 7+ seconds; it was the session's microVM
+spinning up, every single time, because the session id was never reused. The warm
+`message/send` number (3.327s median) is NOT zero and should not be read as "pure
+protocol overhead" either -- that call does real work (LangGraph classify + a live
+Bedrock Haiku `recommend` call), so most of its 3.3s is legitimate compute, not wire
+mechanics. Structurally, the two cold numbers alone (8.318s + 10.539s = 18.857s) land
+almost exactly on the `(c) full A2A -- CONTROL` pattern's own measured median (18.831s,
+see README "Cost") -- that control pattern does precisely a card-fetch-on-one-session
+followed by a message/send-on-another-session, so this isn't a coincidence, it's the same
+mechanism measured two different ways. Of that 18.8s, the two warm-vs-cold deltas
+(-7.335s and -7.212s, 14.5s combined) are cold-start; only ~4.3s (0.982s + 3.327s) is
+real work -- and even that 4.3s is mostly the real model/LangGraph call, not transport.
+**So: whichever of the post's gaps "~15s" was computed from, the evidence says that gap
+is overwhelmingly repeated AgentCore Runtime session cold-start (because every call in
+both `agent.py` and `demo.py` mints a fresh session id), not inherent A2A JSON-RPC/HTTP
+protocol cost.** The post's attribution to "fetching the token, fetching the agent card,
+and the network dispatch" was the right SYMPTOMS, wrong CAUSE: it's not that fetching the
+card is slow because it's A2A, it's that fetching the card (like every other call) lands
+on a session that has never been used before.
+- **Idle-gap probe (single data point, not a sweep):** reused one session id again after a
+  90-second sleep; the reused call measured 0.972s -- indistinguishable from the
+  already-warm median (0.982s) and nothing like the cold median (8.318s). AgentCore
+  Runtime did not treat that session as cold again within 90 seconds idle. Not a proper
+  idle-timeout characterisation (one sample, one gap length), but worth recording: whatever
+  the real idle-timeout window is, it is longer than 90 seconds, at least in this account/
+  region on this day.
+- **Experiment deliberately bypassed the monitoring agent's own LLM tool-calling loop**
+  (i.e. this is `(c) CONTROL`-shaped, not `(c) REAL`-shaped): it calls the remediation
+  runtime's card-fetch and message/send directly, the same way `demo.py`'s own
+  `pattern_c_control_test_finding` does, so cold-vs-warm isn't confounded by the
+  monitoring agent's own variable reasoning time.
+- **Spend for this investigation:** ~$0.0147 (3,000 input / 2,343 output Haiku tokens,
+  pulled live from `AWS/Bedrock` CloudWatch metrics before and after the run), well under
+  the $5 cap -- 15 real `message/send` calls (5 cold + 5 warm-up + 5 measured-warm) each
+  trigger one real LangGraph `recommend()` Bedrock call, same cost shape as `make demo`'s
+  own pattern-(b)/(c) runs.
+- **Stack was redeployed for this investigation and torn down again afterward**, same as
+  every other session in this spec; independently re-verified (not just exit codes):
+  `describe-stacks` (not found), `list-agent-runtimes` (empty), `describe-user-pool` on
+  this deploy's pool id (not found), `describe-alarms` for the test alarm in both
+  `us-east-1` and (see below) `ap-southeast-2` (empty both).
+- **One real mistake this session, caught and fixed before it mattered:** ran
+  `scripts/incident.py` directly (bypassing `make incident`) with a shell that already
+  exported `AWS_REGION=ap-southeast-2` -- the exact failure mode the Makefile's own
+  region-pin comment warns about, now hit by a second person (agent) in a second session.
+  Created a real tagged test alarm in the wrong region for a few minutes; caught because
+  the script prints the region it used, deleted it (`delete-alarms`, verified empty by
+  `describe-alarms` immediately after), then re-ran properly via `make incident` in
+  `us-east-1`. No incident data in the final transcript came from the wrong-region alarm.
+  This is the SAME class of mistake the Makefile comment already documents from
+  2026-10-22 -- worth flagging for `learning-loop` as a second occurrence (direct script
+  invocation bypassing Make's env export) if this repo's sessions keep running scripts
+  outside `make`.

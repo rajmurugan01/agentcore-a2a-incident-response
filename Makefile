@@ -60,6 +60,18 @@ demo:
 tier2-demo:
 	.venv/bin/python3 scripts/tier2_demo.py | tee docs/tier2_transcript.txt
 
+# One-off (2026-10-23): isolates AgentCore Runtime session cold-start from A2A wire-
+# protocol cost, in response to a technical reviewer's pushback on the blog post's "~15s
+# of A2A protocol mechanics" claim. Only needs the MONITORING client's secret (same scope
+# as demo.py's patterns (b)/(c-control): invoking the remediation runtime directly). See
+# scripts/warm_session_experiment.py and docs/specs/agentcore-a2a-incident-response.md's
+# "Warm-vs-cold session investigation" note for the full result.
+warm-session-experiment:
+	@USER_POOL_ID=$$(python3 -c "import json;print(json.load(open('cdk/cdk.outputs.json'))[next(iter(json.load(open('cdk/cdk.outputs.json'))))]['UserPoolId'])"); \
+	MON_CLIENT_ID=$$(python3 -c "import json;print(json.load(open('cdk/cdk.outputs.json'))[next(iter(json.load(open('cdk/cdk.outputs.json'))))]['MonitoringClientId'])"); \
+	MON_SECRET=$$(aws cognito-idp describe-user-pool-client --user-pool-id $$USER_POOL_ID --client-id $$MON_CLIENT_ID --query 'UserPoolClient.ClientSecret' --output text); \
+	MONITORING_CLIENT_SECRET=$$MON_SECRET .venv/bin/python3 scripts/warm_session_experiment.py | tee docs/warm_session_transcript.txt
+
 # Tier 1 criterion 9: also removes the test metric/alarm, not just the AgentCore/Cognito
 # stack -- independently verified (describe-alarms / list-metrics), not just exit codes.
 # Runs BEFORE cdk destroy: the incident alarm/metric are in this account regardless of
@@ -70,4 +82,4 @@ destroy:
 	.venv/bin/python3 scripts/teardown_incident.py
 	cd cdk && npx cdk destroy --force
 
-.PHONY: install deploy incident demo tier2-demo destroy
+.PHONY: install deploy incident demo tier2-demo warm-session-experiment destroy

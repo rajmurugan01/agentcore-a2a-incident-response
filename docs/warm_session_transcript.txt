@@ -1,0 +1,58 @@
+==============================================================================
+Warm vs cold AgentCore Runtime session: isolating cold-start from A2A wire cost
+==============================================================================
+
+Started (UTC): 2026-10-23T09:03:40.221652+00:00
+Remediation runtime ARN: arn:aws:bedrock-agentcore:us-east-1:<redacted-account-id>:runtime/remediation_agent_a2a-odFG1x9JHO
+
+Spend check before running: ~$0.0000 so far this session (in=0 tok, out=0 tok, list-price-derived). Cap: $5.0.
+
+== STEP: GET /.well-known/agent-card.json -- COLD (brand-new session id each rep) ==
+    cold rep 1/5: session=8a6f1e5a-04dc-4ed6-8859-404439b4787a 8.805s (729 bytes)
+    cold rep 2/5: session=542f8f12-5e4a-4e5c-b62c-bf18ca958b35 8.318s (729 bytes)
+    cold rep 3/5: session=10ea6c0d-94bf-4fd8-a52c-3b888d90bc80 8.242s (729 bytes)
+    cold rep 4/5: session=d4e7d671-3b33-4bf1-b867-e69b13b782c9 8.457s (729 bytes)
+    cold rep 5/5: session=5a84b803-7606-4c28-a94e-9b34a2281050 8.308s (729 bytes)
+  card-fetch COLD: min=8.242s median=8.318s max=8.805s (n=5)
+
+== STEP: GET /.well-known/agent-card.json -- WARM (session id warmed by one throwaway call first) ==
+    warm rep 1/5: session=f5d98348-5cc6-4256-b1d8-88a5092f4d78 warm-up=8.256s measured=0.905s (729 bytes)
+    warm rep 2/5: session=f671f747-dcdf-478e-9456-b68afb9c57df warm-up=8.234s measured=0.955s (729 bytes)
+    warm rep 3/5: session=5ce0805c-0a9e-417c-ad42-eb4bb48661d9 warm-up=8.261s measured=0.982s (729 bytes)
+    warm rep 4/5: session=3df0ce25-a56d-4095-9836-d1c50b8719b5 warm-up=8.494s measured=1.137s (729 bytes)
+    warm rep 5/5: session=03ade6a1-b8a4-4b24-90ce-5e2c9b081a5b warm-up=8.388s measured=1.049s (729 bytes)
+  card-fetch WARM: min=0.905s median=0.982s max=1.137s (n=5)
+  card-fetch WARM-UP CALL ITSELF: min=8.234s median=8.261s max=8.494s (n=5)
+
+== STEP: POST message/send -- COLD (brand-new session id each rep) ==
+    cold rep 1/5: session=be30a847-1259-4c48-aed0-91a1c8d585f8 10.648s (931 bytes)
+    cold rep 2/5: session=cda847bb-5e98-4bf3-aa38-210acb46e586 10.539s (937 bytes)
+    cold rep 3/5: session=c927ee8a-5375-43f4-b543-fef93e9b5f5e 10.517s (869 bytes)
+    cold rep 4/5: session=efc1a01d-456c-4ac4-8c4a-c3d1caba9e98 10.576s (866 bytes)
+    cold rep 5/5: session=6808f5c5-d86b-4163-bf3b-2c936479470a 10.506s (909 bytes)
+  message/send COLD: min=10.506s median=10.539s max=10.648s (n=5)
+
+== STEP: POST message/send -- WARM (session id warmed by one throwaway call first) ==
+    warm rep 1/5: session=2245588e-0904-4858-9b17-ccfba0599ce3 warm-up=10.765s measured=3.558s (937 bytes)
+    warm rep 2/5: session=6227f4e7-8dd1-4fc2-95c6-17a36c77d6d5 warm-up=10.704s measured=3.453s (931 bytes)
+    warm rep 3/5: session=d788261d-383a-4ac5-b5ff-523244adf956 warm-up=10.775s measured=3.225s (931 bytes)
+    warm rep 4/5: session=ce679762-e594-42cd-be16-4a6a1b3396fa warm-up=10.359s measured=3.227s (921 bytes)
+    warm rep 5/5: session=d4ac3238-7af9-4fe7-96c6-3d503f3f995e warm-up=10.573s measured=3.327s (862 bytes)
+  message/send WARM: min=3.225s median=3.327s max=3.558s (n=5)
+  message/send WARM-UP CALL ITSELF: min=10.359s median=10.704s max=10.775s (n=5)
+
+== Delta summary (median warm - median cold; negative = warm faster) ==
+  card-fetch:   cold median 8.318s -> warm median 0.982s  (delta -7.335s)
+  message/send: cold median 10.539s -> warm median 3.327s  (delta -7.212s)
+
+== Idle-gap probe: reuse a session id again after a delay, see if it's still warm ==
+  probe session a71b1f73-2ecc-4bde-8069-300edab39fa4: warm-up call 8.306s
+  sleeping 90s before reusing the SAME session id...
+  same session id, after 90s idle: 0.972s (compare to warm median 0.982s and cold median 8.318s)
+
+== Spend after this run ==
+  ~$0.0147 (in=3000 tok, out=2343 tok)
+
+Finished (UTC): 2026-10-23T09:08:56.615892+00:00
+
+Done.
